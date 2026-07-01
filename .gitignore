@@ -1,0 +1,6 @@
+.venv/
+.DS_Store
+data/
+notebooks/
+Qwen3-Audiobook-Studio/
+Qwen3-Audiobook-Studio-v1.0-lite/
