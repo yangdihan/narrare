@@ -1,0 +1,1087 @@
+# Design Document
+
+## Vision
+
+Narrare is not a TTS application.
+
+Narrare is an audiobook production pipeline.
+
+The project prioritizes quality, auditability, and human review over automation.
+
+---
+
+# Overall Architecture
+
+Novel
+
+↓
+
+Document Loader
+
+↓
+
+Chunk Manager
+
+↓
+
+LLM Pipeline
+
+↓
+
+Annotated Script (IR)
+
+↓
+
+Voice Assignment
+
+↓
+
+Segment Generation
+
+↓
+
+Human Review
+
+↓
+
+Audio Post-processing
+
+↓
+
+Final Assembly
+
+↓
+
+Audiobook
+
+---
+
+# Current Repository Context
+
+This repository is not yet a clean implementation.
+
+It currently contains:
+
+- `data/raw/`
+
+  Source novel files used for testing.
+
+  `两百岁的寿星.txt` is the current full TXT test input.
+
+  `两百岁的寿星1.txt` is the smaller scoped test input.
+
+- `data/voices/`
+
+  Raw voice sample audio files.
+
+  These are source samples for voice cloning or voice-profile creation.
+
+- `data/interim/`
+
+  Intended location for generated intermediate artifacts.
+
+  This should become the default workspace for IR, segment plans, generated takes, review state, and assembly manifests.
+
+- `data/processed/`
+
+  Intended location for approved final outputs.
+
+- `notebooks/`
+
+  Previous manual tooling.
+
+  These notebooks and helper scripts demonstrate the workflow problems Narrare must solve:
+
+  - convert script JSON to a TTS-friendly text format
+  - detect missing `seg_###.wav` files
+  - generate retry input for failed or deleted segments
+  - map regenerated clips back to original segment indices
+  - concatenate segment WAV files into a final output
+
+  This folder is reference material only.
+
+  It is not the target architecture.
+
+- `Qwen3-Audiobook-Studio/`
+
+  A downloaded Gradio TTS application.
+
+  It is useful as a reference for Qwen TTS usage patterns, but it should not be treated as Narrare architecture.
+
+- `Qwen3-Audiobook-Studio-v1.0-lite/`
+
+  A larger downloaded package containing local Qwen models, a bundled runtime, saved `.pt` voice prompts, and Gradio demo scripts.
+
+  This is most useful as a local model and asset source.
+
+  Narrare should extract the functional TTS calls behind its own adapter instead of importing the GUI application directly.
+
+---
+
+# Existing Experimental Workflow
+
+The previous manual workflow can be summarized as:
+
+Novel-derived script JSON
+
+↓
+
+Speaker-tagged TTS text
+
+↓
+
+Batch TTS generation into `seg_###.wav`
+
+↓
+
+Manual listening and deletion of bad segments
+
+↓
+
+Missing segment scan
+
+↓
+
+Retry script generation
+
+↓
+
+Regenerated clips remapped to original segment indices
+
+↓
+
+Final WAV concatenation
+
+This is the clearest current proof of what Narrare needs to productize.
+
+The correct product version is not a notebook.
+
+The correct product version is:
+
+- explicit segment IDs
+- immutable text spans
+- versioned audio takes
+- review status per segment
+- regeneration queues
+- assembly manifests
+- reproducible output folders
+
+---
+
+# Target Directory Design
+
+The long-term source tree should move toward:
+
+```text
+core/
+  Business logic.
+  No UI.
+  No model-specific APIs.
+
+core/models/
+  Pydantic data models for documents, spans, IR segments, characters, voices, takes, review state, and assembly manifests.
+
+core/document/
+  TXT loading, future EPUB/MOBI/HTML/Markdown loading, source hashing, and source span management.
+
+core/chunking/
+  Context-window chunking with overlap tracking.
+
+core/ir/
+  IR generation orchestration, validation, and integrity checks.
+
+core/review/
+  Review state transitions, approval/rejection, regeneration queue creation.
+
+core/audio/
+  Segment take bookkeeping, silence insertion plans, final assembly logic.
+
+config/
+  Centralized runtime configuration.
+  Provider names, model names, model paths, and API settings live here.
+
+llm/
+  Shared LLM service and LLM adapters.
+  No pipeline stage calls a provider API directly.
+
+tts/
+  TTS adapters only.
+  Qwen should be one adapter, not a core dependency.
+
+storage/
+  Read/write layer for JSON artifacts and audio artifact paths.
+
+ui/
+  Human review interface.
+  No direct AI model calls.
+
+docs/
+  Documentation.
+```
+
+Existing `data/` should remain the default local artifact root.
+
+Downloaded third-party projects should not become part of the core source tree.
+
+---
+
+# MVP LLM Provider Decision
+
+For the MVP, Narrare uses OpenRouter as the sole LLM provider.
+
+The default model for every LLM stage is OpenAI GPT-5 Mini through OpenRouter.
+
+The model identifier should be stored as:
+
+```yaml
+llm:
+  provider: openrouter
+  model: openai/gpt-5-mini
+```
+
+An equivalent configuration file or object is acceptable.
+
+The model name and provider must never be hard-coded inside business logic.
+
+## Rationale
+
+Narrare is intended to support both Chinese and English novels.
+
+The MVP does not optimize for the absolute best model for each language.
+
+The MVP prioritizes:
+
+- a single, stable model for the full pipeline
+- strong multilingual performance across Chinese and English
+- reliable structured output
+- good instruction following
+- reasonable inference cost
+- easy future replacement
+
+OpenRouter provides an OpenAI-compatible API while allowing the underlying model to be swapped later with minimal code changes.
+
+## LLM Abstraction
+
+Every pipeline stage must request an LLM through a shared service.
+
+No stage should directly call OpenRouter, OpenAI, or any other provider.
+
+```text
+Dialogue Extraction
+        │
+Speaker Identification
+        │
+Emotion Annotation
+        │
+Pause Estimation
+        │
+Character Summarization
+        │
+Future Features
+        │
+      LLM Service
+        │
+   OpenRouter Adapter
+        │
+ OpenAI GPT-5 Mini
+```
+
+The rest of the application must remain unaware of which provider or model is being used.
+
+Prompts, pipeline logic, UI components, and storage formats must not require changes when changing models.
+
+## Future Compatibility
+
+The architecture should allow replacing the model with a single configuration change.
+
+Examples:
+
+- `openai/gpt-5`
+- `qwen/...`
+- `deepseek/...`
+- `anthropic/...`
+- `google/...`
+
+## Non-goal
+
+Do not optimize model selection during the MVP.
+
+The priority is to build a complete, reliable, end-to-end audiobook production workflow.
+
+After the workflow is stable, Narrare can add a benchmarking framework to compare models for quality, latency, and cost.
+
+Only then should individual pipeline stages migrate to different models, and only when the benefit is measurable.
+
+---
+
+# Artifact Model
+
+Narrare should store every important intermediate artifact.
+
+For a single source document, the workspace should eventually look like:
+
+```text
+data/interim/<project_id>/
+  source_manifest.json
+  chunks.json
+  ir_segments.json
+  characters.json
+  voice_profiles.json
+  voice_assignments.json
+  generation_plan.json
+  review_state.json
+  assembly_manifest.json
+  logs/
+  audio/
+    segments/
+      <segment_id>/
+        take_0001.wav
+        take_0002.wav
+    final/
+      audiobook.wav
+```
+
+`source_manifest.json` stores:
+
+- source file path
+- source hash
+- encoding
+- character count
+- created timestamp
+
+`ir_segments.json` stores immutable text segments and metadata.
+
+`review_state.json` stores human decisions.
+
+`assembly_manifest.json` stores the exact approved takes and pause durations used for final assembly.
+
+The original novel file is never edited.
+
+---
+
+# Stage 1 — Annotated Script Generation
+
+## Input
+
+TXT document.
+
+Future versions will support:
+
+- EPUB
+- MOBI
+- HTML
+- Markdown
+
+---
+
+## Chunking
+
+Long novels exceed LLM context windows.
+
+Documents are split into chunks.
+
+Each chunk includes overlapping context.
+
+The overlap exists only for reasoning.
+
+Overlapping text must never appear twice in the final output.
+
+---
+
+## Multi-pass LLM Pipeline
+
+Rather than relying on one large prompt, Narrare uses multiple specialized passes.
+
+Every pass uses the shared LLM Service.
+
+For the MVP, every pass uses the configured OpenRouter model.
+
+No pass may hard-code `openai/gpt-5-mini` or any other model name.
+
+Detailed prompt contracts live in `prompts.md`.
+
+This document describes the architecture-level intent.
+
+### Pass 1 — Chunk Context Summarizer
+
+Summarize surrounding context for the current chunk.
+
+This improves later reasoning about speakers, aliases, pronouns, and emotional state.
+
+The summary is metadata only.
+
+It never becomes audiobook text.
+
+---
+
+### Pass 2 — Script Converter
+
+Convert raw novel text into immutable structured script segments.
+
+This stage separates narration, dialogue, and internal monologue.
+
+Concatenating every segment text must reproduce the source chunk exactly.
+
+---
+
+### Pass 3 — Character Canonicalizer & Profiler
+
+Maintain the character registry.
+
+Merge aliases only when supported by evidence.
+
+Attach canonical speaker IDs to segments.
+
+---
+
+### Pass 4 — Tone & Pause Annotator
+
+Add TTS-oriented metadata.
+
+Examples include:
+
+- calm
+- nervous
+- sarcastic
+- excited
+- grieving
+- pause duration
+- speaking rate
+- vocal intensity
+
+---
+
+### Pass 5 — Pronunciation & TTS Hint Generator
+
+Generate optional pronunciation and glossary metadata.
+
+This is useful for:
+
+- Chinese polyphonic characters
+- foreign names
+- fantasy terminology
+- abbreviations
+- numbers
+- dates
+- invented words
+
+This stage never changes script text.
+
+---
+
+### Deterministic Integrity Validation
+
+Before scrutiny and human review, code must verify:
+
+```text
+concatenate(all segment text) == original chunk text
+```
+
+and eventually:
+
+```text
+concatenate(all final segment text) == original novel text
+```
+
+exactly.
+
+The LLM may inspect validation reports, but deterministic equality checks are not delegated to the LLM.
+
+---
+
+### Pass 6 — Script Scrutinizer
+
+Audit the generated IR, metadata, and deterministic validation report.
+
+This stage finds suspicious speaker attribution, alias handling, tone labels, pause durations, and pronunciation hints.
+
+It does not modify anything.
+
+---
+
+### Human Review
+
+Human review happens after the generated IR and validation reports are available.
+
+Users edit any metadata.
+
+The original text cannot be edited.
+
+---
+
+# Intermediate Representation
+
+The IR is the most important artifact.
+
+Example:
+
+```json
+{
+  "segment_id": "...",
+  "source_span": [1024,1189],
+  "speaker":"Harry",
+  "text":"...",
+  "emotion":"nervous",
+  "pause_after_ms":300,
+  "confidence":0.96
+}
+```
+
+Only metadata changes.
+
+Text remains immutable.
+
+The IR should never contain normalized or rewritten text.
+
+If a TTS adapter needs model-specific text cleanup, that cleanup must be stored separately as generation metadata and must not replace the IR text.
+
+---
+
+# Character Database
+
+Characters become reusable objects.
+
+Each character stores:
+
+- canonical name
+- aliases
+- personality summary
+- speaking style
+- age impression
+- voice assignment
+
+Future:
+
+- default speed
+- default emotion
+- pronunciation hints
+
+---
+
+# Stage 2
+
+## Voice Assignment
+
+The LLM summarizes every character.
+
+This call also goes through the shared LLM Service.
+
+The user selects one voice profile.
+
+This mapping is stored.
+
+Example
+
+Harry
+
+↓
+
+Voice Profile 03
+
+---
+
+## Segment Generation
+
+Generate one audio file per segment.
+
+Never overwrite previous versions.
+
+Each generated file is a take.
+
+Takes are linked to:
+
+- segment ID
+- TTS adapter
+- model path or model identifier
+- voice profile
+- generation parameters
+- random seed when supported
+- source IR version
+- created timestamp
+
+The current Qwen experiments use `seg_###.wav`.
+
+Narrare should move to stable segment IDs internally, while still allowing export to ordered `seg_###.wav` names when useful.
+
+---
+
+## Human Review
+
+Interface
+
+Column 1
+
+Original Novel
+
+Column 2
+
+Annotated Script
+
+Column 3
+
+Generated Audio
+
+Users may
+
+- play
+- replay
+- approve
+- reject
+- regenerate
+
+---
+
+## Regeneration
+
+Rejected segments enter a queue.
+
+Regeneration may change
+
+- random seed
+- sampling
+
+Future
+
+- speaking rate
+- pitch
+- emotion
+- style
+
+---
+
+## Version History
+
+Every generated audio is preserved.
+
+Users can compare multiple versions.
+
+Approved versions become active.
+
+---
+
+# Qwen TTS Integration
+
+The Qwen projects are integration references, not Narrare architecture.
+
+Useful Qwen APIs:
+
+- `Qwen3TTSModel.from_pretrained(...)`
+- `generate_voice_clone(...)`
+- `create_voice_clone_prompt(...)`
+- `generate_custom_voice(...)`
+- `generate_voice_design(...)`
+
+Useful Qwen artifacts:
+
+- local model directories under `Qwen3-Audiobook-Studio-v1.0-lite/models/`
+- saved `.pt` voice prompt files under `Qwen3-Audiobook-Studio-v1.0-lite/voices/`
+- raw voice samples under `data/voices/`
+
+Qwen adapter responsibilities:
+
+- load and unload Qwen models
+- create reusable voice prompts from raw audio samples
+- synthesize one segment at a time from IR text
+- return audio data or write a take file
+- report model metadata and generation parameters
+
+Qwen adapter non-responsibilities:
+
+- parse novels
+- mutate IR text
+- manage UI state
+- decide approval/rejection
+- assemble final audiobooks
+
+The Gradio apps currently mix all of these concerns.
+
+Narrare must separate them.
+
+---
+
+# Final Assembly
+
+Only approved segments are assembled.
+
+Assembly performs
+
+- pause insertion
+- concatenation
+
+The final assembly should consume only `assembly_manifest.json`.
+
+It should not read the original novel.
+
+It should not call an LLM.
+
+It should not call TTS.
+
+It should fail if any required segment lacks an approved take.
+
+Future
+
+- loudness normalization
+- denoise
+- ambience matching
+- chapter music
+- mastering
+
+---
+
+# Future Features
+
+## Expressive TTS
+
+Use emotion metadata.
+
+Examples
+
+happy
+
+sad
+
+whisper
+
+shouting
+
+---
+
+## Chapter Atmosphere
+
+Generate chapter-level summaries.
+
+Example
+
+Winter night.
+
+Quiet.
+
+Melancholic.
+
+Sparse piano.
+
+Low strings.
+
+This prompt can drive music generation.
+
+---
+
+## Background Music
+
+Chapter
+
+↓
+
+Prompt
+
+↓
+
+Music Generator
+
+↓
+
+Loop Generation
+
+↓
+
+Background Mixing
+
+---
+
+## Audio Normalization
+
+Different voice samples produce different acoustic signatures.
+
+Normalize
+
+- noise floor
+- loudness
+- EQ
+
+before mixing.
+
+---
+
+# Implementation Plan
+
+## Phase 0 — Repository Cleanup and Boundaries
+
+Goal:
+
+Make the project boundaries explicit without deleting experimental material.
+
+Tasks:
+
+- create the target package directories
+- keep downloaded Qwen projects isolated as third-party references
+- document which existing folders are source data, generated data, experiments, and external code
+- add centralized configuration for LLM provider/model settings
+- add Python project metadata
+- add Ruff, Black, and basic test configuration
+
+Expected result:
+
+The repository has a clean Narrare source tree and a single configuration layer while preserving current experiments.
+
+---
+
+## Phase 1 — Core Data Models
+
+Goal:
+
+Define the objects that every future stage will share.
+
+Initial Pydantic models:
+
+- `SourceDocument`
+- `SourceSpan`
+- `Chunk`
+- `IRSegment`
+- `Character`
+- `VoiceProfile`
+- `VoiceAssignment`
+- `GenerationRequest`
+- `AudioTake`
+- `SegmentReview`
+- `AssemblyManifest`
+- `LLMConfig`
+- `TTSConfig`
+
+Important rules:
+
+- `IRSegment.text` must match the source span exactly.
+- metadata must be editable separately from text.
+- segment IDs must be stable.
+- every artifact must be JSON serializable except binary audio files.
+- provider and model names must be configuration data, not business logic.
+
+Expected result:
+
+The project has a typed IR contract before any model calls are added.
+
+---
+
+## Phase 2 — TXT Loader and Integrity Validation
+
+Goal:
+
+Load TXT input and prove that generated segment text still reconstructs the original.
+
+Tasks:
+
+- load `data/raw/两百岁的寿星1.txt`
+- detect encoding explicitly
+- store source hash
+- create a simple initial segmentation strategy
+- validate `concatenate(segment.text) == source_text`
+- write artifacts into `data/interim/<project_id>/`
+
+Expected result:
+
+Narrare can create and validate a minimal IR without LLM or TTS.
+
+---
+
+## Phase 3 — Manual IR Review Baseline
+
+Goal:
+
+Support human-in-the-loop work before full automation.
+
+Tasks:
+
+- create a reviewable JSON format for segments
+- allow manual edits to speaker, emotion, pause, and confidence
+- forbid edits to original segment text
+- produce a regeneration-safe `review_state.json`
+
+Expected result:
+
+A user can inspect and correct metadata while the source text remains immutable.
+
+---
+
+## Phase 4 — LLM Service Abstraction
+
+Goal:
+
+Create the shared LLM entry point used by every LLM pipeline stage.
+
+Tasks:
+
+- define an `LLMService` interface
+- define request and response models for structured JSON output
+- define an `OpenRouterAdapter`
+- load provider and model from centralized configuration
+- set OpenRouter as the MVP provider
+- set `openai/gpt-5-mini` as the default model
+- ensure the chunk summarizer, script converter, character canonicalizer, tone annotator, pronunciation hint generator, and script scrutinizer use the shared service
+- forbid direct provider calls in pipeline stages
+
+Expected result:
+
+All LLM stages can use OpenRouter through one abstraction, and changing models is a configuration-only operation.
+
+---
+
+## Phase 5 — TTS Adapter Interface
+
+Goal:
+
+Abstract TTS engines before integrating Qwen.
+
+Tasks:
+
+- define a `TTSAdapter` protocol
+- define `synthesize_segment(request) -> AudioTake`
+- define voice profile loading
+- define generation parameter models
+- add a dummy TTS adapter for tests
+
+Expected result:
+
+Core generation workflow can be tested without Qwen, torch, or model weights.
+
+---
+
+## Phase 6 — Qwen Adapter Extraction
+
+Goal:
+
+Wrap Qwen TTS functionality in Narrare's adapter interface.
+
+Tasks:
+
+- load local Qwen model paths from configuration
+- load saved `.pt` voice prompts
+- generate one audio take for one IR segment
+- save take files under the Narrare artifact structure
+- record model path, voice profile, parameters, and seed
+- avoid importing Gradio app code
+
+Expected result:
+
+Narrare can generate segment audio through Qwen while core logic remains model-agnostic.
+
+---
+
+## Phase 7 — Regeneration Queue
+
+Goal:
+
+Replace the notebook missing-file workflow with explicit review state.
+
+Tasks:
+
+- mark segment takes as approved or rejected
+- create regeneration requests for rejected segments
+- preserve rejected takes
+- generate new takes without overwriting old ones
+- select one active take per approved segment
+
+Expected result:
+
+Manual deletion of bad WAV files is no longer part of the workflow.
+
+---
+
+## Phase 8 — Final Assembly
+
+Goal:
+
+Build the final audiobook from approved takes only.
+
+Tasks:
+
+- read `assembly_manifest.json`
+- verify every segment has an approved active take
+- insert pause durations
+- concatenate WAV files
+- write output to `data/processed/<project_id>/`
+- write assembly logs
+
+Expected result:
+
+The final output is reproducible from stored artifacts.
+
+---
+
+## Phase 9 — UI
+
+Goal:
+
+Create the human review surface after the data and workflow are stable.
+
+Initial UI should show:
+
+- original text segment
+- metadata fields
+- assigned voice
+- generated takes
+- audio playback
+- approve/reject controls
+- regenerate action
+
+Strict boundary:
+
+UI calls Narrare services.
+
+UI does not call Qwen, LLMs, or audio assembly directly.
+
+---
+
+# Future Compatibility
+
+## Multi-language
+
+Chinese
+
+English
+
+Future:
+
+Japanese
+
+---
+
+## Supported Formats
+
+TXT
+
+↓
+
+EPUB
+
+↓
+
+MOBI
+
+↓
+
+HTML
+
+↓
+
+Markdown
+
+---
+
+# Non-goals
+
+Narrare does not aim to
+
+- train foundation models
+- become another TTS framework
+- replace human narration
+
+It aims to become the best human-AI audiobook production workflow.
+
+---
+
+# Guiding Principle
+
+AI models will continue to evolve.
+
+The workflow should remain stable.
+
+The workflow is the product.
