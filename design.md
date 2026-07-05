@@ -1,12 +1,6 @@
 # Design Document
 
-## Vision
-
-Narrare is not a TTS application.
-
 Narrare is an audiobook production pipeline.
-
-The project prioritizes quality, auditability, and human review over automation.
 
 ---
 
@@ -185,7 +179,7 @@ core/document/
   TXT loading, future EPUB/MOBI/HTML/Markdown loading, source hashing, and source span management.
 
 core/chunking/
-  Context-window chunking with overlap tracking.
+  LLM-request chunking with paragraph grouping, character bounds, token estimates, and overlap tracking.
 
 core/ir/
   IR generation orchestration, validation, and integrity checks.
@@ -402,11 +396,15 @@ Detailed prompt contracts live in `prompts.md`.
 
 This document describes the architecture-level intent.
 
-### Pass 1 — Chunk Context Summarizer
+### Pass 1 — Chunk Context & Character Profiler
 
 Summarize surrounding context for the current chunk.
 
 This improves later reasoning about speakers, aliases, pronouns, and emotional state.
+
+Because this pass already views the chunk from a higher-level plot perspective, it also identifies active characters, observed aliases, lightweight profile details, and evidence-backed character registry updates.
+
+TODO: use this pass to flag age or life-phase voice variants. If the same story identity appears as a child, adult, or older version across a long enough time span to need different voices, Narrare should represent those as linked voice characters such as `character`, `character_kid`, and `character_old`.
 
 The summary is metadata only.
 
@@ -418,23 +416,59 @@ It never becomes audiobook text.
 
 Convert raw novel text into immutable structured script segments.
 
-This stage separates narration, dialogue, and internal monologue.
+This pass operates directly on one deterministic chunk.
 
-Concatenating every segment text must reproduce the source chunk exactly.
+Chunking is responsible for grouping natural paragraphs into LLM-sized request units, with default character bounds around 750-2,000 characters and a target around 1,500 characters.
+
+For the MVP, each output-bearing script segment is a single speaker-keyed object.
+
+Narration uses the reserved key `narrator`.
+
+Character speech or thought uses the inferred raw character key.
+
+Uncertain speech uses the reserved key `unknown_speaker`.
+
+The MVP does not distinguish dialogue from internal monologue in the script IR.
+
+Short narration, such as speech tags, remains output-bearing script text and must not be discarded.
+
+The LLM does not return `segment_id` or `source_span`.
+
+Code derives IDs and spans deterministically from the ordered script text.
+
+Concatenating every segment text must reproduce the source chunk content after voice-content normalization.
+
+Whitespace, indentation, line breaks, and punctuation are not voice-bearing content, so Stage 2 validation ignores them.
+
+Only voice-bearing characters are strict reconstruction targets: Chinese characters, letters, and digits.
+
+After content-match validation succeeds, code deterministically merges adjacent same-speaker segments by concatenating their text and expanding the span, then validates reconstruction again.
 
 ---
 
-### Pass 3 — Character Canonicalizer & Profiler
+### Deterministic Speaker Key Normalization
 
-Maintain the character registry.
+After Pass 1 and Pass 2, code should normalize script speaker keys using the character registry and alias evidence.
 
-Merge aliases only when supported by evidence.
+For example, if `Harry`, `Potter`, and `The Boy Who Lived` are proven aliases for the same character, their script keys should be renamed to the same canonical key before tone annotation, pronunciation hints, scrutiny, review, and voice assignment.
 
-Attach canonical speaker IDs to segments.
+This is deterministic business logic, not an LLM pass.
+
+Only metadata keys may change:
+
+- `script` object keys may be renamed.
+- `script` object values must remain exactly unchanged.
+- `source_span` values must remain unchanged.
+- `segment_id` values must remain unchanged.
+- `narrator` must not be renamed.
+- uncertain aliases must remain unresolved for human review.
+- raw speaker keys should be preserved as audit metadata.
+
+Deterministic text integrity validation must still pass after normalization.
 
 ---
 
-### Pass 4 — Tone & Pause Annotator
+### Pass 3 — Tone & Pause Annotator
 
 Add TTS-oriented metadata.
 
@@ -451,7 +485,7 @@ Examples include:
 
 ---
 
-### Pass 5 — Pronunciation & TTS Hint Generator
+### Pass 4 — Pronunciation & TTS Hint Generator
 
 Generate optional pronunciation and glossary metadata.
 
@@ -489,7 +523,7 @@ The LLM may inspect validation reports, but deterministic equality checks are no
 
 ---
 
-### Pass 6 — Script Scrutinizer
+### Pass 5 — Script Scrutinizer
 
 Audit the generated IR, metadata, and deterministic validation report.
 
@@ -548,6 +582,7 @@ Each character stores:
 - personality summary
 - speaking style
 - age impression
+- voice variant notes
 - voice assignment
 
 Future:
@@ -555,6 +590,7 @@ Future:
 - default speed
 - default emotion
 - pronunciation hints
+- linked age or life-phase voice variants
 
 ---
 
@@ -567,6 +603,8 @@ The LLM summarizes every character.
 This call also goes through the shared LLM Service.
 
 The user selects one voice profile.
+
+TODO: support linked age or life-phase variants for the same story identity. A character may require separate voice assignments for child, adult, and older versions when the novel spans a long enough time or explicitly changes the character's voice.
 
 This mapping is stored.
 
@@ -849,7 +887,7 @@ Initial Pydantic models:
 
 Important rules:
 
-- `IRSegment.text` must match the source span exactly.
+- `IRSegment.text` must match the source span after voice-content normalization for Stage 2 script conversion.
 - metadata must be editable separately from text.
 - segment IDs must be stable.
 - every artifact must be JSON serializable except binary audio files.
@@ -915,7 +953,7 @@ Tasks:
 - load provider and model from centralized configuration
 - set OpenRouter as the MVP provider
 - set `openai/gpt-5-mini` as the default model
-- ensure the chunk summarizer, script converter, character canonicalizer, tone annotator, pronunciation hint generator, and script scrutinizer use the shared service
+- ensure the chunk context and character profiler, script converter, tone annotator, pronunciation hint generator, and script scrutinizer use the shared service
 - forbid direct provider calls in pipeline stages
 
 Expected result:

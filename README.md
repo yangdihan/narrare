@@ -1,10 +1,10 @@
 # Narrare
 
-Narrare is a local-first audiobook production pipeline.
+Narrare is a local-first audiobook production workflow for turning novels into faithful, multi-voice audiobooks.
 
-Unlike traditional one-click audiobook generators, Narrare focuses on producing high-quality audiobooks through AI-assisted workflows and human review.
+Unlike tools that rewrite a novel into a radio drama script, Narrare preserves the original text exactly. AI-generated metadata, such as speaker labels, emotion, pacing, and voice suggestions, is stored separately from the source text.
 
-The goal is to let AI perform repetitive work while humans remain responsible for creative judgment.
+The key feature is controllable production: different characters can use different voices, and humans can inspect, adjust, regenerate, or override AI decisions at each important step before final assembly.
 
 ---
 
@@ -109,6 +109,10 @@ Chunking
 ↓
 
 LLM Pipeline
+
+↓
+
+Speaker Key Normalization
 
 ↓
 

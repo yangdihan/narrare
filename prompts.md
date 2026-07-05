@@ -53,7 +53,8 @@ These rules apply to every prompt.
 
 - The original novel is the single source of truth.
 - Never rewrite, summarize, normalize, translate, correct, or otherwise alter original text.
-- Never change punctuation, whitespace, line breaks, quotation marks, or wording.
+- Never change voice-bearing characters or wording.
+- Whitespace, indentation, line breaks, and punctuation may be omitted in Stage 2 script output because they are not voice-bearing content.
 - Every response must be valid JSON.
 - Do not wrap JSON in Markdown.
 - If uncertain, lower the confidence score instead of hallucinating.
@@ -64,7 +65,7 @@ These rules apply to every prompt.
 
 ---
 
-# Stage 1 — Chunk Context Summarizer
+# Stage 1 — Chunk Context & Character Profiler
 
 ## Purpose
 
@@ -72,9 +73,15 @@ Long novels exceed LLM context windows.
 
 Before processing a chunk, Narrare generates a concise context summary so later stages can reason about the current scene.
 
+While reasoning about the chunk at this higher level, the same pass also identifies active characters, observed aliases, lightweight character traits, and evidence-backed registry updates.
+
 This stage exists only to improve reasoning.
 
 Its output never becomes part of the final audiobook.
+
+Its character observations are metadata used to update the character registry and to help later stages choose speaker labels.
+
+The source text remains immutable.
 
 ## Input
 
@@ -86,7 +93,7 @@ Its output never becomes part of the final audiobook.
 
 ## Output
 
-The stage should generate:
+Context output:
 
 - current scene summary
 - active characters
@@ -96,6 +103,34 @@ The stage should generate:
 - important context
 - confidence
 - review notes
+
+Character registry update output:
+
+- `character_id` or `proposed_character_id`
+- `canonical_name`
+- `aliases`
+- `alias_evidence`
+- `persona_summary`
+- `speaking_style`
+- `age_impression`
+- `voice_variant_notes`
+- `confidence`
+- `review_notes`
+
+Alias evidence should be structured enough for deterministic code to generate a dictionary like:
+
+```json
+{
+  "character_001": {
+    "canonical_name": "Harry Potter",
+    "aliases": ["Harry Potter", "Harry", "Potter", "The Boy Who Lived"]
+  }
+}
+```
+
+Do not use this stage to attach canonical speaker IDs to script segments. Segment-level speaker attribution belongs to Stage 2.
+
+TODO: detect age or time-span voice variants during this stage. If the same story identity appears at meaningfully different ages or life phases that require different voices, the profiler should flag voice-split candidates such as `character`, `character_kid`, and `character_old`. These variants are still linked to the same story identity, but they may need separate audiobook character records for voice assignment.
 
 ## Prompt Draft
 
@@ -108,15 +143,26 @@ Do not rewrite the novel.
 Do not invent plot details.
 Do not add information that is not supported by the provided text or existing registry.
 
+While summarizing the chunk, also maintain character metadata.
+
 Focus on:
 
 - active scene
 - current speakers
-- known aliases
+- active characters
+- aliases observed in this chunk
+- alias-to-character evidence
 - unresolved references
 - relationships
 - emotional state
+- concise persona and speaking-style evidence
+- possible age or life-phase voice variants
 
+Merge aliases only when strongly supported by the provided text, overlap context, or existing registry.
+Do not merge uncertain identities.
+If one story identity appears across significantly different ages or life phases, flag this as a voice-variant candidate instead of forcing one voice profile.
+If uncertain, keep aliases separate, lower confidence, and add a review note.
+Return structured character observations that deterministic code can convert into a character-to-alias dictionary.
 Return valid JSON only.
 ```
 
@@ -130,139 +176,202 @@ Convert raw novel text into structured script segments.
 
 This is the most important LLM stage.
 
-The generated segment text must preserve the original chunk exactly.
+The generated segment text must preserve the original chunk after voice-content normalization.
+
+Stage 2 runs directly on one deterministic chunk.
+
+Chunking groups natural paragraphs into LLM-sized request units before Stage 2.
+
+Narrare derives `segment_id` and `source_span` deterministically after the LLM returns ordered script text.
+
+For the MVP, the output script does not distinguish dialogue from internal monologue.
+
+Each output-bearing script segment is represented as a single speaker-keyed object:
+
+```json
+{"character": "content"}
+```
+
+Narration is always represented with the reserved speaker key `narrator`:
+
+```json
+{"narrator": "content"}
+```
+
+Short narration and attribution text must still be preserved as its own script content.
+
+For example, `他说` must appear as narrator content and must not be dropped, merged into metadata, or rewritten.
 
 ## Hard Constraints
 
-- Concatenating every generated `original_text` value must reproduce the original chunk exactly.
-- No characters may be changed.
-- No punctuation may be changed.
-- No whitespace may be changed.
-- No line breaks may be changed.
+- Concatenating the single content value from every generated `script` object must reproduce the original chunk content after voice-content normalization.
+- No voice-bearing characters may be changed.
+- Whitespace, indentation, line breaks, and punctuation may be omitted or changed because they are not voice-bearing content.
+- Every original voice-bearing character must appear in exactly one output-bearing script segment.
+- Do not omit short narration, speech tags, or attribution phrases.
+- Whitespace-only and punctuation-only spans may be omitted.
+- Do not ask the LLM to return numeric spans.
 
 ## Input
 
 - current chunk
-- chunk start offset
-- context summary
-- character registry
+- known character roster from prior validated chunks
+- last 3 validated script segments
+- context summary, when available
 
 ## Output
 
 Each segment contains:
 
-- `segment_id`
-- `source_span`
-- `segment_type`
-- `speaker_raw`
-- `original_text`
+- `script`
 - `confidence`
 - `review_notes`
 
-Segment types:
+`script` must be an object with exactly one key.
 
-- `narration`
-- `dialogue`
-- `internal_monologue`
+The key is either:
+
+- `narrator`
+- `unknown_speaker`
+- the raw character or speaker label inferred from the text
+
+The value is original voice-bearing text copied from the chunk.
+
+Code will assign `segment_id` and `source_span` after validation.
+
+After content-match validation passes, Narrare deterministically merges consecutive segments with the same speaker key by concatenating their text values.
+
+The merged result is validated again while ignoring whitespace and punctuation.
+
+Example:
+
+```json
+{
+  "segments": [
+    {
+      "script": {"narrator": "安德鲁·马丁说，"},
+      "confidence": 0.98,
+      "review_notes": []
+    },
+    {
+      "script": {"安德鲁·马丁": "“谢谢，”"},
+      "confidence": 0.95,
+      "review_notes": []
+    }
+  ]
+}
+```
 
 ## Prompt Draft
 
 ```text
-Convert the novel chunk into structured script segments.
+Convert the script chunk into structured script segments.
 
-Preserve every character exactly.
+Preserve original content exactly.
 
-Assign each segment to one of:
+Each output-bearing segment must contain a `script` object with exactly one key and one value.
 
-- narration
-- dialogue
-- internal_monologue
+If the text is narration, use the reserved key `narrator`.
+
+If the text is spoken or thought by a character, use the best raw character or speaker label as the key.
+
+If the speaker is uncertain, use the reserved key `unknown_speaker`.
 
 Infer the most likely speaker.
 
 If uncertain, choose the best candidate while lowering confidence and adding a review note.
 
+Preserve even very short narration, including speech tags such as `他说`.
+
+Whitespace before dialogue, including blank lines and full-width indentation, is optional in Stage 2 output.
+
+Punctuation is also optional in Stage 2 output.
+
+Never use attribution phrases such as `他说` or `她问道` as speaker keys.
+
 Do not normalize names.
-Do not rewrite dialogue.
-Do not trim or alter whitespace.
+Do not rewrite text.
+Do not change voice-bearing text.
 
 Return valid JSON only.
 ```
 
+## Deterministic Post-processing
+
+After Stage 2 output passes content reconstruction validation:
+
+- merge adjacent segments with the same `script` key;
+- concatenate their script text values without adding or removing voice-bearing characters;
+- expand the merged `source_span` to cover the original adjacent spans;
+- set merged confidence to the minimum confidence of the merged segments;
+- preserve review notes;
+- validate content reconstruction again while ignoring whitespace and punctuation.
+
 ---
 
-# Stage 3 — Character Canonicalizer & Profiler
+# Deterministic Step — Speaker Key Normalizer
 
 ## Purpose
 
-Normalize character references and maintain a global character registry.
+After Stage 1 and Stage 2 are complete, Narrare should deterministically unify script speaker keys for aliases that refer to the same character.
 
-This stage prevents the same character from appearing under multiple names.
+Stage 2 may output raw speaker keys such as:
 
-Example:
-
-```text
-Harry Potter
-Harry
-Potter
-The Boy Who Lived
+```json
+{"Harry": "text"}
+{"Potter": "text"}
+{"The Boy Who Lived": "text"}
 ```
 
-may all map to:
+If Stage 1 produced evidence-backed registry data proving these labels refer to the same character, this deterministic step renames the script keys to one canonical key before later stages consume the script.
 
-```text
-character_001
-```
-
-when evidence strongly supports the merge.
-
-This stage also builds lightweight character profiles.
+This is not an LLM stage.
 
 ## Input
 
-- script segments
+- Stage 1 character registry updates
 - existing character registry
-- context summary
+- Stage 2 script segments
 
 ## Output
 
-Character registry updates:
+- script segments with normalized speaker keys
+- alias-to-canonical rename report
+- review notes for unresolved or ambiguous aliases
 
-- `character_id`
-- `canonical_name`
-- `aliases`
-- `persona_summary`
-- `speaking_style`
-- `age_impression`
-- `confidence`
-- `review_notes`
+## Hard Constraints
 
-Segment updates:
+- Only the `script` object key may be renamed.
+- The `script` object value must remain byte-for-byte identical.
+- `source_span` must remain unchanged.
+- `segment_id` must remain unchanged.
+- `narrator` must never be renamed.
+- Ambiguous aliases must not be renamed automatically.
+- The raw speaker key should be preserved as metadata for audit and human review.
+- Deterministic text integrity validation must still pass after key normalization.
 
-- `segment_id`
-- `canonical_speaker_id`
-- `confidence`
-- `review_notes`
+Example:
 
-## Prompt Draft
-
-```text
-Maintain the character registry for this audiobook script.
-
-Merge aliases only when strongly supported by the provided text, existing registry, or context summary.
-
-Do not merge uncertain identities.
-
-Generate concise persona and speaking-style summaries based only on evidence already seen.
-
-For uncertain speaker identities, keep the original raw speaker metadata and add a review note.
-
-Return valid JSON only.
+```json
+{
+  "segment_id": "seg_000042",
+  "source_span": {"start": 120, "end": 128},
+  "script": {"Harry Potter": "text"},
+  "raw_script_key": "The Boy Who Lived",
+  "speaker_key_normalization": {
+    "from": "The Boy Who Lived",
+    "to": "Harry Potter",
+    "source": "character_registry",
+    "confidence": 0.97
+  },
+  "confidence": 0.94,
+  "review_notes": []
+}
 ```
 
 ---
 
-# Stage 4 — Tone & Pause Annotator
+# Stage 3 — Tone & Pause Annotator
 
 ## Purpose
 
@@ -320,7 +429,7 @@ Return valid JSON only.
 
 ---
 
-# Stage 5 — Pronunciation & TTS Hint Generator
+# Stage 4 — Pronunciation & TTS Hint Generator
 
 ## Purpose
 
@@ -384,7 +493,7 @@ Return valid JSON only.
 
 ---
 
-# Stage 6 — Script Scrutinizer
+# Stage 5 — Script Scrutinizer
 
 ## Purpose
 
@@ -444,11 +553,11 @@ Return valid JSON only.
 ```text
 Novel
   |
-Chunk Context Summarizer
+Chunk Context & Character Profiler
   |
 Script Converter
   |
-Character Canonicalizer & Profiler
+Speaker Key Normalizer
   |
 Tone & Pause Annotator
   |
@@ -484,6 +593,7 @@ Potential future stages:
 - chapter atmosphere summarizer
 - background music prompt generator
 - voice casting recommendation
+- age and life-phase voice variant detection
 - character relationship graph builder
 - story timeline extraction
 - chapter recap generation
