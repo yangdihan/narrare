@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Narrare Pipeline</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Narrare Pipeline</h1>
+      <nav aria-label="Pipeline stages">
+        <button class="tab active" type="button" data-tab="chunking">Chunking</button>
+        <button class="tab" type="button" data-tab="stage2">Stage 2</button>
+      </nav>
+    </header>
+
+    <main>
+      <section id="chunking-panel" class="tab-panel active">
+        <div class="toolbar">
+          <label>
+            Source
+            <select id="source-select"></select>
+          </label>
+          <label>
+            Project ID
+            <input id="project-id" type="text" autocomplete="off" />
+          </label>
+          <button id="chunk-button" class="primary" type="button">chunk it</button>
+          <span id="chunk-status" class="status"></span>
+        </div>
+
+        <div class="workspace">
+          <section class="pane">
+            <div class="pane-header">
+              <h2>Original</h2>
+            </div>
+            <pre id="source-text" class="text-view"></pre>
+          </section>
+
+          <section class="pane">
+            <div class="pane-header">
+              <h2>Chunks</h2>
+            </div>
+            <div id="chunk-output" class="chunk-list"></div>
+          </section>
+        </div>
+      </section>
+
+      <section id="stage2-panel" class="tab-panel">
+        <div class="toolbar">
+          <label>
+            Project ID
+            <input id="stage-project-id" type="text" autocomplete="off" />
+          </label>
+          <button id="load-project-button" type="button">Load chunks</button>
+          <button id="stage2-button" class="primary" type="button">feed to LLM</button>
+          <progress id="stage-progress" value="0" max="1"></progress>
+          <span id="stage-status" class="status"></span>
+        </div>
+
+        <div class="workspace">
+          <section class="pane split-left">
+            <div class="chunk-chooser" id="stage-chunks"></div>
+            <div>
+              <div class="pane-header">
+                <h2>Chunk <span id="selected-chunk-label"></span></h2>
+              </div>
+              <pre id="stage-chunk-text" class="text-view"></pre>
+            </div>
+          </section>
+
+          <section class="pane">
+            <div class="pane-header">
+              <h2>Script</h2>
+              <span id="script-status" class="status"></span>
+            </div>
+            <div id="script-output" class="script-list"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
+
