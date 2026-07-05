@@ -165,6 +165,18 @@ Everything should communicate through well-defined data models.
 
 ---
 
+## Current Development Scope
+
+Ignore the webapp for now.
+
+Do not work on `/ui/web`, FastAPI routes, browser templates, frontend assets, or local dashboard behavior unless the user explicitly asks for webapp work.
+
+When making pipeline changes, first identify the pipeline stage being discussed. State the stage in your working notes or final response, then inspect and modify only code, prompts, tests, and documentation that are directly relevant to that stage.
+
+Avoid broad cross-stage refactors. If a requested change appears to touch multiple stages, separate the stage-specific work and explain the boundary before editing.
+
+---
+
 ## Long-term Vision
 
 Narrare should eventually become a general AI-assisted audiobook production platform capable of integrating different LLMs, TTS systems, music generators, and post-processing tools while preserving a single human-centered workflow.

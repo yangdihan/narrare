@@ -4,3 +4,15 @@ data/
 notebooks/
 Qwen3-Audiobook-Studio/
 Qwen3-Audiobook-Studio-v1.0-lite/
+.env
+.env.*
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
