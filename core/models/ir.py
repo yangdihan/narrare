@@ -31,6 +31,9 @@ class ScriptSegment(BaseModel):
     segment_id: str
     source_span: SourceSpan
     script: dict[str, str]
+    raw_script_key: str | None = None
+    speaker_key_normalization: dict[str, object] | None = None
+    speaker_key_review: dict[str, object] | None = None
     confidence: float = Field(ge=0.0, le=1.0)
     review_notes: list[str] = Field(default_factory=list)
 
@@ -56,7 +59,7 @@ class ScriptArtifact(BaseModel):
     chunk_sha256: str
     llm_provider: str
     llm_model: str
-    response_source: Literal["llm", "response_path"]
+    response_source: Literal["llm", "response_path", "assembled", "speaker_key_review"]
     processed_chunk_count: int = Field(ge=0)
     segments: list[ScriptSegment]
 
@@ -75,3 +78,19 @@ class ScriptValidationReport(BaseModel):
     source_hash: str
     reconstructed_hash: str
     errors: list[str] = Field(default_factory=list)
+
+
+class SpeakerKeyReviewResponse(BaseModel):
+    segment_id: str
+    current_key: str
+    decision: Literal["keep", "replace", "uncertain"]
+    replacement_key: str | None = None
+    confidence: float = Field(ge=0.0, le=1.0)
+    evidence: list[str] = Field(default_factory=list)
+    review_notes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def ensure_replace_has_replacement(self) -> "SpeakerKeyReviewResponse":
+        if self.decision == "replace" and not self.replacement_key:
+            raise ValueError("replacement_key is required when decision=replace")
+        return self

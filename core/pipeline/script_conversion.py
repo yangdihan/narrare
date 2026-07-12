@@ -8,7 +8,14 @@ from typing import Callable
 from config.loader import load_config
 from config.models import AppConfig
 from core.ir.script_builder import derive_script_segments, merge_consecutive_same_speaker
+from core.ir.script_repair import (
+    RepairDiagnosis,
+    RepairSpan,
+    diagnose_repair_span,
+    renumber_segments,
+)
 from core.models.ir import (
+    RawScriptSegment,
     ScriptArtifact,
     ScriptConverterResponse,
     ScriptSegment,
@@ -21,6 +28,7 @@ from core.validation.script_integrity import (
 from llm.json_utils import parse_json_object_response
 from llm.prompts.script_converter import (
     SYSTEM_PROMPT,
+    build_script_repair_user_prompt,
     build_script_converter_user_prompt,
 )
 from llm.schemas import LlmCompletion
@@ -38,6 +46,8 @@ class ScriptProgress:
     chunk_elapsed_seconds: float
     status: str
     errors: list[str]
+    repair_start: int | None = None
+    repair_end: int | None = None
 
 
 ProgressCallback = Callable[[ScriptProgress], None]
@@ -63,6 +73,7 @@ def run_script_conversion_workflow(
     workspace_root: str | Path = "data/interim",
     progress_callback: ProgressCallback | None = None,
     llm_service: LlmService | None = None,
+    enable_shrinking_retry: bool = True,
 ) -> ScriptConversionResult:
     app_config = config or load_config()
     chunk_text_value = Path(chunk_path).read_text(encoding="utf-8")
@@ -92,7 +103,6 @@ def run_script_conversion_workflow(
     prompt = build_script_converter_user_prompt(
         chunk_id=chunk_id,
         chunk_text=chunk_text_value,
-        known_characters=[],
         previous_segments=[],
     )
     segments = _convert_script_chunk(
@@ -108,6 +118,7 @@ def run_script_conversion_workflow(
         max_retries=max_retries,
         progress_callback=progress_callback,
         chunk_started_at=chunk_started_at,
+        enable_shrinking_retry=enable_shrinking_retry and response_path is None,
     )
 
     artifact = ScriptArtifact(
@@ -191,9 +202,11 @@ def _convert_script_chunk(
     max_retries: int,
     progress_callback: ProgressCallback | None,
     chunk_started_at: float,
+    enable_shrinking_retry: bool,
 ) -> list[ScriptSegment]:
     last_errors: list[str] = []
     attempts = 1 if response_path else max_retries
+    max_repair_attempts = 2
 
     for attempt in range(1, attempts + 1):
         attempt_started_at = time.monotonic()
@@ -248,14 +261,6 @@ def _convert_script_chunk(
         try:
             response_data = parse_json_object_response(completion.content)
             converter_response = ScriptConverterResponse.model_validate(response_data)
-            segments = derive_script_segments(
-                converter_response.segments,
-                source_start=0,
-                starting_index=0,
-                source_text=chunk_text,
-                source_end=len(chunk_text),
-                chunk_id=chunk_id,
-            )
         except Exception as exc:
             last_errors = [f"invalid script converter JSON: {exc}"]
             attempt_elapsed = time.monotonic() - attempt_started_at
@@ -279,14 +284,30 @@ def _convert_script_chunk(
             )
             continue
 
+        alignment_errors: list[str] = []
+        try:
+            segments = derive_script_segments(
+                converter_response.segments,
+                source_start=0,
+                starting_index=0,
+                source_text=chunk_text,
+                source_end=len(chunk_text),
+                chunk_id=chunk_id,
+            )
+        except Exception as exc:
+            alignment_errors = [f"script text alignment failed: {exc}"]
+            segments = []
+
+        repair_diagnosis: RepairDiagnosis | None = None
         validation_report = validate_script_segments(
             project_id=project_id,
             chunk_id=chunk_id,
             source_text=chunk_text,
             segments=segments,
         )
+        validation_report.errors.extend(alignment_errors)
 
-        if validation_report.exact_reconstruction_success:
+        if validation_report.exact_reconstruction_success and not alignment_errors:
             segments = merge_consecutive_same_speaker(segments, starting_index=0)
             validation_report = validate_script_segments(
                 project_id=project_id,
@@ -294,6 +315,35 @@ def _convert_script_chunk(
                 source_text=chunk_text,
                 segments=segments,
             )
+        elif enable_shrinking_retry and llm_service is not None:
+            repair_diagnosis = diagnose_repair_span(
+                chunk_text,
+                converter_response.segments,
+            )
+            if repair_diagnosis is not None:
+                repaired_segments = _run_shrinking_repair(
+                    project_id=project_id,
+                    chunk_id=chunk_id,
+                    chunk_text=chunk_text,
+                    chunk_path=chunk_path,
+                    llm_service=llm_service,
+                    system_prompt=system_prompt,
+                    workspace=workspace,
+                    attempt=attempt,
+                    parent_max_attempts=attempts,
+                    max_repair_attempts=max_repair_attempts,
+                    progress_callback=progress_callback,
+                    chunk_started_at=chunk_started_at,
+                    repair_diagnosis=repair_diagnosis,
+                )
+                if repaired_segments is not None:
+                    segments = repaired_segments
+                    validation_report = validate_script_segments(
+                        project_id=project_id,
+                        chunk_id=chunk_id,
+                        source_text=chunk_text,
+                        segments=segments,
+                    )
 
         write_json(
             workspace.script_attempt_artifact_path(chunk_id, attempt),
@@ -324,6 +374,14 @@ def _convert_script_chunk(
             return segments
 
         last_errors = validation_report.errors
+        if repair_diagnosis is not None:
+            last_errors = [
+                *last_errors,
+                (
+                    "shrinking repair failed for "
+                    f"source_span={repair_diagnosis.span.start}:{repair_diagnosis.span.end}"
+                ),
+            ]
         _emit_attempt_progress(
             progress_callback,
             chunk_id,
@@ -337,6 +395,232 @@ def _convert_script_chunk(
 
     raise RuntimeError(
         f"Script chunk {chunk_id} failed validation: " + "; ".join(last_errors)
+    )
+
+
+def _run_shrinking_repair(
+    *,
+    project_id: str,
+    chunk_id: str,
+    chunk_text: str,
+    chunk_path: str,
+    llm_service: LlmService,
+    system_prompt: str,
+    workspace: Workspace,
+    attempt: int,
+    parent_max_attempts: int,
+    max_repair_attempts: int,
+    progress_callback: ProgressCallback | None,
+    chunk_started_at: float,
+    repair_diagnosis: RepairDiagnosis,
+) -> list[ScriptSegment] | None:
+    diagnosis = repair_diagnosis
+
+    for repair_attempt in range(1, max_repair_attempts + 1):
+        repair_started_at = time.monotonic()
+        _emit_progress(
+            progress_callback,
+            ScriptProgress(
+                chunk_id=chunk_id,
+                attempt=attempt,
+                max_attempts=parent_max_attempts,
+                attempt_elapsed_seconds=0.0,
+                chunk_elapsed_seconds=repair_started_at - chunk_started_at,
+                status="repair_started",
+                errors=[],
+                repair_start=diagnosis.span.start,
+                repair_end=diagnosis.span.end,
+            ),
+        )
+        repair_prompt = build_script_repair_user_prompt(
+            chunk_id=chunk_id,
+            repair_start=diagnosis.span.start,
+            repair_end=diagnosis.span.end,
+            repair_text=chunk_text[diagnosis.span.start : diagnosis.span.end],
+            prefix_segments=_segment_context(diagnosis.prefix_segments[-3:]),
+            suffix_segments=_segment_context(diagnosis.suffix_segments[:3]),
+            reason=diagnosis.span.reason,
+        )
+        try:
+            completion = llm_service.complete_json(system_prompt, repair_prompt)
+        except Exception as exc:
+            errors = [f"LLM repair request failed: {exc}"]
+            _write_repair_validation_report(
+                project_id,
+                chunk_id,
+                chunk_text,
+                errors,
+                workspace,
+                attempt,
+                repair_attempt,
+            )
+            _emit_attempt_progress(
+                progress_callback,
+                chunk_id,
+                attempt,
+                parent_max_attempts,
+                time.monotonic() - repair_started_at,
+                chunk_started_at,
+                "repair_failed",
+                errors,
+                repair_span=diagnosis.span,
+            )
+            continue
+
+        raw_path = workspace.script_repair_raw_response_path(
+            chunk_id, attempt, repair_attempt
+        )
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_path.write_text(completion.content.strip() + "\n", encoding="utf-8")
+
+        try:
+            response_data = parse_json_object_response(completion.content)
+            repair_response = ScriptConverterResponse.model_validate(response_data)
+            repair_segments = derive_script_segments(
+                repair_response.segments,
+                source_start=diagnosis.span.start,
+                starting_index=len(diagnosis.prefix_segments),
+                source_text=chunk_text,
+                source_end=diagnosis.span.end,
+                chunk_id=chunk_id,
+            )
+        except Exception as exc:
+            errors = [f"invalid repair JSON: {exc}"]
+            _write_repair_validation_report(
+                project_id,
+                chunk_id,
+                chunk_text,
+                errors,
+                workspace,
+                attempt,
+                repair_attempt,
+            )
+            _emit_attempt_progress(
+                progress_callback,
+                chunk_id,
+                attempt,
+                parent_max_attempts,
+                time.monotonic() - repair_started_at,
+                chunk_started_at,
+                "repair_failed",
+                errors,
+                repair_span=diagnosis.span,
+            )
+            continue
+
+        repair_validation_report = validate_script_segments(
+            project_id=project_id,
+            chunk_id=chunk_id,
+            source_text=chunk_text,
+            segments=repair_segments,
+            source_start=diagnosis.span.start,
+            source_end=diagnosis.span.end,
+        )
+        assembled_segments = renumber_segments(
+            [
+                *diagnosis.prefix_segments,
+                *repair_segments,
+                *diagnosis.suffix_segments,
+            ]
+        )
+        assembled_segments = merge_consecutive_same_speaker(
+            assembled_segments, starting_index=0
+        )
+        full_validation_report = validate_script_segments(
+            project_id=project_id,
+            chunk_id=chunk_id,
+            source_text=chunk_text,
+            segments=assembled_segments,
+        )
+        if not repair_validation_report.exact_reconstruction_success:
+            full_validation_report.errors.extend(
+                [
+                    "repair span validation failed: " + error
+                    for error in repair_validation_report.errors
+                ]
+            )
+
+        write_json(
+            workspace.script_repair_artifact_path(chunk_id, attempt, repair_attempt),
+            {
+                "project_id": project_id,
+                "chunk_id": chunk_id,
+                "chunk_source_path": chunk_path,
+                "repair_source_span": {
+                    "start": diagnosis.span.start,
+                    "end": diagnosis.span.end,
+                },
+                "repair_segments": [segment.model_dump() for segment in repair_segments],
+                "assembled_segments": [
+                    segment.model_dump() for segment in assembled_segments
+                ],
+            },
+        )
+        write_json(
+            workspace.script_repair_validation_report_path(
+                chunk_id, attempt, repair_attempt
+            ),
+            full_validation_report,
+        )
+
+        if full_validation_report.exact_reconstruction_success:
+            _emit_attempt_progress(
+                progress_callback,
+                chunk_id,
+                attempt,
+                parent_max_attempts,
+                time.monotonic() - repair_started_at,
+                chunk_started_at,
+                "repair_complete",
+                [],
+                repair_span=diagnosis.span,
+            )
+            return assembled_segments
+
+        next_diagnosis = diagnose_repair_span(
+            chunk_text,
+            _segments_to_raw(assembled_segments),
+        )
+        if next_diagnosis is not None:
+            diagnosis = next_diagnosis
+
+        _emit_attempt_progress(
+            progress_callback,
+            chunk_id,
+            attempt,
+            parent_max_attempts,
+            time.monotonic() - repair_started_at,
+            chunk_started_at,
+            "repair_failed",
+            full_validation_report.errors,
+            repair_span=diagnosis.span,
+        )
+
+    return None
+
+
+def _write_repair_validation_report(
+    project_id: str,
+    chunk_id: str,
+    chunk_text: str,
+    errors: list[str],
+    workspace: Workspace,
+    attempt: int,
+    repair_attempt: int,
+) -> None:
+    report = validate_script_segments(
+        project_id=project_id,
+        chunk_id=chunk_id,
+        source_text=chunk_text,
+        segments=[],
+    )
+    report.errors.extend(errors)
+    report.exact_reconstruction_success = False
+    write_json(
+        workspace.script_repair_validation_report_path(
+            chunk_id, attempt, repair_attempt
+        ),
+        report,
     )
 
 
@@ -388,6 +672,7 @@ def _emit_attempt_progress(
     chunk_started_at: float,
     status: str,
     errors: list[str],
+    repair_span: RepairSpan | None = None,
 ) -> None:
     _emit_progress(
         progress_callback,
@@ -399,28 +684,32 @@ def _emit_attempt_progress(
             chunk_elapsed_seconds=time.monotonic() - chunk_started_at,
             status=status,
             errors=errors,
+            repair_start=repair_span.start if repair_span is not None else None,
+            repair_end=repair_span.end if repair_span is not None else None,
         ),
     )
 
 
-def _known_characters(segments: list[ScriptSegment]) -> list[str]:
-    return sorted(
-        {
-            segment.speaker
-            for segment in segments
-            if segment.speaker not in {"narrator", "unknown_speaker"}
-        }
-    )
-
-
-def _previous_segment_context(segments: list[ScriptSegment]) -> list[dict[str, object]]:
+def _segment_context(segments: list[ScriptSegment]) -> list[dict[str, object]]:
     return [
         {
             "script": segment.script,
             "confidence": segment.confidence,
             "review_notes": segment.review_notes,
+            "source_span": segment.source_span.model_dump(),
         }
-        for segment in segments[-3:]
+        for segment in segments
+    ]
+
+
+def _segments_to_raw(segments: list[ScriptSegment]) -> list[RawScriptSegment]:
+    return [
+        RawScriptSegment(
+            script=segment.script,
+            confidence=segment.confidence,
+            review_notes=segment.review_notes,
+        )
+        for segment in segments
     ]
 
 
