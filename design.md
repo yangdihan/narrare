@@ -402,7 +402,11 @@ Summarize surrounding context for the current chunk.
 
 This improves later reasoning about speakers, aliases, pronouns, and emotional state.
 
-Because this pass already views the chunk from a higher-level plot perspective, it also identifies active characters, observed aliases, lightweight profile details, and evidence-backed character registry updates.
+Because this pass already views the chunk from a higher-level plot perspective, it also identifies active characters, stable aliases, contextual references, lightweight profile details, and evidence-backed character registry updates.
+
+Stable aliases are globally safe identity names such as full names and stable short names.
+
+Contextual references are local-only hints such as honorifics, role titles, relationship titles, pronouns, and descriptive phrases. Examples include `马丁先生`, `先生`, `小先生`, `我的当事人`, and `那个自由的机器人`. These references can help Stage 2 choose a speaker key in the current scene, but they must not become global replacement aliases.
 
 TODO: use this pass to flag age or life-phase voice variants. If the same story identity appears as a child, adult, or older version across a long enough time span to need different voices, Narrare should represent those as linked voice characters such as `character`, `character_kid`, and `character_old`.
 
@@ -424,7 +428,7 @@ For the MVP, each output-bearing script segment is a single speaker-keyed object
 
 Narration uses the reserved key `narrator`.
 
-Character speech or thought uses the inferred raw character key.
+Character speech or thought uses the inferred character key.
 
 Uncertain speech uses the reserved key `unknown_speaker`.
 
@@ -444,15 +448,43 @@ Only voice-bearing characters are strict reconstruction targets: Chinese charact
 
 After content-match validation succeeds, code deterministically merges adjacent same-speaker segments by concatenating their text and expanding the span, then validates reconstruction again.
 
+If a full-chunk Stage 2 attempt returns valid JSON but fails source/script alignment, the retry path may run a shrinking repair.
+
+Shrinking repair is internal: code finds stable script anchors before and after the mismatch, expands the failed region to paragraph boundaries, asks the LLM to regenerate only that span, splices the repaired segments back into the chunk, and validates the whole chunk again.
+
+If no stable prefix or suffix anchor exists, Stage 2 falls back to the normal whole-chunk retry.
+
+After every chunk has a validated Stage 2 script artifact, code assembles one complete script artifact from the chunks in manifest order.
+
+Assembly shifts chunk-local spans into complete-script coordinates.
+
+If the final segment of one chunk and the first segment of the next chunk share the same speaker key, assembly merges them by concatenating text, expanding the span, preserving review notes, and keeping the lower confidence.
+
+The complete script is validated against the concatenated chunk text.
+
 ---
 
-### Deterministic Speaker Key Normalization
+### Pass 3 — Speaker Key Reviewer
 
-After Pass 1 and Pass 2, code should normalize script speaker keys using the character registry and alias evidence.
+After Pass 1, Pass 2, and deterministic assembly, Narrare reviews suspicious speaker keys with a key-only LLM pass.
 
-For example, if `Harry`, `Potter`, and `The Boy Who Lived` are proven aliases for the same character, their script keys should be renamed to the same canonical key before tone annotation, pronunciation hints, scrutiny, review, and voice assignment.
+The reviewer skips segments whose key is already a canonical character name or `narrator`.
 
-This is deterministic business logic, not an LLM pass.
+It reviews aliases such as `安德鲁`, contextual references such as `马丁先生`, and unresolved keys such as `unknown_speaker`.
+
+For each candidate, the reviewer receives:
+
+- current script key-value pair;
+- previous and next key-value pairs when available;
+- Stage 1 scene context for the segment's source chunk;
+- relevant character debriefs from the Stage 1 character registry;
+- the allowed replacement keys.
+
+It returns `keep`, `replace`, or `uncertain`.
+
+Replacement keys must be canonical character names, `narrator`, or `unknown_speaker`.
+
+Only high-confidence replacements are applied automatically.
 
 Only metadata keys may change:
 
@@ -460,15 +492,16 @@ Only metadata keys may change:
 - `script` object values must remain exactly unchanged.
 - `source_span` values must remain unchanged.
 - `segment_id` values must remain unchanged.
-- `narrator` must not be renamed.
-- uncertain aliases must remain unresolved for human review.
-- raw speaker keys should be preserved as audit metadata.
+- existing segment confidence values must remain unchanged.
+- raw speaker keys should be preserved as audit metadata on changed segments.
 
-Deterministic text integrity validation must still pass after normalization.
+Deterministic text integrity validation must still pass after key review.
+
+The old deterministic `speaker-key-normalize` command remains available as a legacy/debug step for stable-alias registry checks, but it is no longer the recommended production flow.
 
 ---
 
-### Pass 3 — Tone & Pause Annotator
+### Pass 4 — Tone & Pause Annotator
 
 Add TTS-oriented metadata.
 

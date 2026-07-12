@@ -39,6 +39,10 @@ The original text remains untouched.
 
 Annotated Script
 
+Per-chunk script artifacts are deterministically assembled into one complete script after all chunks pass validation.
+
+When a valid Stage 2 response misaligns with the source, Narrare can retry only the paragraph-bounded failed span and then revalidate the whole chunk.
+
 ↓
 
 Audio Segments
@@ -112,7 +116,11 @@ LLM Pipeline
 
 ↓
 
-Speaker Key Normalization
+Script Assembly
+
+↓
+
+Stage 3 Speaker Key Review
 
 ↓
 
@@ -141,6 +149,86 @@ Final Assembly
 ↓
 
 Audiobook
+
+---
+
+# Running The Current Pipeline
+
+Set the project ID first. This must match the folder under `data/interim/`.
+
+Specific current project:
+
+```bash
+PROJECT_ID=bicentennial_man
+```
+
+General form:
+
+```bash
+PROJECT_ID=<your_project_id>
+```
+
+If chunks do not exist yet, create them from a TXT source:
+
+```bash
+.venv/bin/python -m cli.main chunk data/raw/<source>.txt --project-id "$PROJECT_ID"
+```
+
+Recommended order for script conversion and speaker-key standardization:
+
+1. Run Stage 1 over chunks, in order.
+2. Run Stage 2 per chunk, starting from the first missing or invalid chunk.
+3. Assemble the validated chunk scripts once.
+4. Run Stage 3 on the assembled complete script.
+
+Specific command sequence starting Stage 2 at chunk 16:
+
+```bash
+.venv/bin/python -m cli.main context-profile --project-id "$PROJECT_ID"
+
+for chunk_path in data/interim/$PROJECT_ID/chunks/chunk_*.txt; do
+  chunk_id=$(basename "$chunk_path" .txt)
+  chunk_num=${chunk_id#chunk_}
+  if [ "$chunk_num" -ge 16 ]; then
+    .venv/bin/python -m cli.main script-convert "$chunk_path" \
+      --project-id "$PROJECT_ID" \
+      --chunk-id "$chunk_id"
+  fi
+done
+
+.venv/bin/python -m cli.main script-assemble --project-id "$PROJECT_ID"
+
+.venv/bin/python -m cli.main speaker-key-review --project-id "$PROJECT_ID"
+```
+
+General reusable form:
+
+```bash
+PROJECT_ID=<your_project_id>
+START_CHUNK=<first_chunk_number_to_process>
+
+.venv/bin/python -m cli.main context-profile --project-id "$PROJECT_ID"
+
+for chunk_path in data/interim/$PROJECT_ID/chunks/chunk_*.txt; do
+  chunk_id=$(basename "$chunk_path" .txt)
+  chunk_num=${chunk_id#chunk_}
+  if [ "$chunk_num" -ge "$START_CHUNK" ]; then
+    .venv/bin/python -m cli.main script-convert "$chunk_path" \
+      --project-id "$PROJECT_ID" \
+      --chunk-id "$chunk_id"
+  fi
+done
+
+.venv/bin/python -m cli.main script-assemble --project-id "$PROJECT_ID"
+
+.venv/bin/python -m cli.main speaker-key-review --project-id "$PROJECT_ID"
+```
+
+The final key-reviewed script is written to:
+
+```bash
+data/interim/$PROJECT_ID/ir/script/complete_key_reviewed_script.json
+```
 
 ---
 

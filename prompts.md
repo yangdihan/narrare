@@ -79,7 +79,7 @@ This stage exists only to improve reasoning.
 
 Its output never becomes part of the final audiobook.
 
-Its character observations are metadata used to update the character registry and to help later stages choose speaker labels.
+Its character observations are metadata used to update the character registry and to help Stage 3 review speaker labels after Stage 2 assembly.
 
 The source text remains immutable.
 
@@ -97,7 +97,8 @@ Context output:
 
 - current scene summary
 - active characters
-- aliases observed
+- stable aliases observed
+- contextual references observed
 - current emotional state
 - unresolved pronouns
 - important context
@@ -108,7 +109,8 @@ Character registry update output:
 
 - `character_id` or `proposed_character_id`
 - `canonical_name`
-- `aliases`
+- `stable_aliases`
+- `contextual_references`
 - `alias_evidence`
 - `persona_summary`
 - `speaking_style`
@@ -117,18 +119,20 @@ Character registry update output:
 - `confidence`
 - `review_notes`
 
-Alias evidence should be structured enough for deterministic code to generate a dictionary like:
+Stable alias evidence should be structured enough for deterministic code to generate a dictionary like:
 
 ```json
 {
   "character_001": {
     "canonical_name": "Harry Potter",
-    "aliases": ["Harry Potter", "Harry", "Potter", "The Boy Who Lived"]
+    "stable_aliases": ["Harry Potter", "Harry", "Potter"]
   }
 }
 ```
 
-Do not use this stage to attach canonical speaker IDs to script segments. Segment-level speaker attribution belongs to Stage 2.
+Contextual references are local-only speaker attribution hints. Honorifics, relationship titles, role titles, pronouns, and descriptive phrases such as `马丁先生`, `先生`, `小先生`, `我的当事人`, or `那个自由的机器人` must not be treated as globally stable aliases.
+
+Do not use this stage to attach canonical speaker IDs to script segments. Segment-level speaker attribution belongs to Stage 2 and Stage 3 speaker-key review.
 
 TODO: detect age or time-span voice variants during this stage. If the same story identity appears at meaningfully different ages or life phases that require different voices, the profiler should flag voice-split candidates such as `character`, `character_kid`, and `character_old`. These variants are still linked to the same story identity, but they may need separate audiobook character records for voice assignment.
 
@@ -150,19 +154,23 @@ Focus on:
 - active scene
 - current speakers
 - active characters
-- aliases observed in this chunk
-- alias-to-character evidence
+- stable aliases observed in this chunk
+- contextual references observed in this chunk
+- reference-to-character evidence
 - unresolved references
 - relationships
 - emotional state
 - concise persona and speaking-style evidence
 - possible age or life-phase voice variants
 
-Merge aliases only when strongly supported by the provided text, overlap context, or existing registry.
+Put only globally stable identity names in `stable_aliases`.
+Put honorifics, relationship titles, role titles, pronouns, and descriptive phrases in `contextual_references`.
+Each observed reference must include `reference_type`: `stable_name`, `honorific`, `role_title`, `relationship_title`, `pronoun`, or `descriptive_phrase`.
+Only `reference_type=stable_name` can be used later for deterministic global speaker-key normalization. Contextual references can still be used as local evidence in Stage 3 review.
 Do not merge uncertain identities.
 If one story identity appears across significantly different ages or life phases, flag this as a voice-variant candidate instead of forcing one voice profile.
 If uncertain, keep aliases separate, lower confidence, and add a review note.
-Return structured character observations that deterministic code can convert into a character-to-alias dictionary.
+Return structured character observations that deterministic code can convert into stable aliases plus local-only contextual hints.
 Return valid JSON only.
 ```
 
@@ -215,9 +223,7 @@ For example, `他说` must appear as narrator content and must not be dropped, m
 ## Input
 
 - current chunk
-- known character roster from prior validated chunks
 - last 3 validated script segments
-- context summary, when available
 
 ## Output
 
@@ -281,6 +287,8 @@ Infer the most likely speaker.
 
 If uncertain, choose the best candidate while lowering confidence and adding a review note.
 
+Never use `character_id` values as speaker keys.
+
 Preserve even very short narration, including speech tags such as `他说`.
 
 Whitespace before dialogue, including blank lines and full-width indentation, is optional in Stage 2 output.
@@ -289,7 +297,7 @@ Punctuation is also optional in Stage 2 output.
 
 Never use attribution phrases such as `他说` or `她问道` as speaker keys.
 
-Do not normalize names.
+Do not globally normalize names.
 Do not rewrite text.
 Do not change voice-bearing text.
 
@@ -307,37 +315,59 @@ After Stage 2 output passes content reconstruction validation:
 - preserve review notes;
 - validate content reconstruction again while ignoring whitespace and punctuation.
 
+If a full-chunk attempt returns valid JSON but fails source/script alignment:
+
+- locate stable script anchors before and after the mismatch;
+- expand the mismatch to paragraph boundaries inside the same chunk;
+- retry only that internal repair span with nearby good segments as context;
+- splice the repaired span between the known-good prefix and suffix;
+- revalidate the complete chunk.
+
+If no stable prefix or suffix can be found, retry the whole chunk instead.
+
+After all chunks pass Stage 2:
+
+- concatenate chunk script artifacts in chunk order into one complete script artifact;
+- shift each chunk-local `source_span` into complete-script coordinates;
+- if the last segment of one chunk and the first segment of the next chunk use the same `script` key, merge them deterministically;
+- validate the complete script against the concatenated chunk text while ignoring whitespace and punctuation.
+
 ---
 
-# Deterministic Step — Speaker Key Normalizer
+# Stage 3 — Speaker Key Reviewer
 
 ## Purpose
 
-After Stage 1 and Stage 2 are complete, Narrare should deterministically unify script speaker keys for aliases that refer to the same character.
+After Stage 1, Stage 2, and deterministic script assembly are complete, Narrare reviews suspicious speaker keys with a key-only LLM pass.
 
 Stage 2 may output raw speaker keys such as:
 
 ```json
 {"Harry": "text"}
-{"Potter": "text"}
-{"The Boy Who Lived": "text"}
+{"马丁先生": "text"}
+{"unknown_speaker": "text"}
 ```
 
-If Stage 1 produced evidence-backed registry data proving these labels refer to the same character, this deterministic step renames the script keys to one canonical key before later stages consume the script.
+Stage 3 reviews only segments whose key is not already a canonical character name or `narrator`.
 
-This is not an LLM stage.
+It compares the current segment, previous segment, next segment, Stage 1 scene context, and relevant character debriefs.
+
+It can suggest replacing the key with a canonical character name, `narrator`, or `unknown_speaker`.
+
+This stage never rewrites script values.
 
 ## Input
 
-- Stage 1 character registry updates
-- existing character registry
-- Stage 2 script segments
+- assembled Stage 2 script
+- Stage 1 character registry
+- Stage 1 chunk context artifacts
+- chunks manifest for source-span-to-chunk mapping
 
 ## Output
 
-- script segments with normalized speaker keys
-- alias-to-canonical rename report
-- review notes for unresolved or ambiguous aliases
+- key-reviewed script segments
+- speaker-key review report
+- raw LLM responses per reviewed segment
 
 ## Hard Constraints
 
@@ -345,10 +375,14 @@ This is not an LLM stage.
 - The `script` object value must remain byte-for-byte identical.
 - `source_span` must remain unchanged.
 - `segment_id` must remain unchanged.
+- Existing segment confidence must remain unchanged.
 - `narrator` must never be renamed.
-- Ambiguous aliases must not be renamed automatically.
+- Canonical character names are skipped by default.
+- `unknown_speaker`, raw aliases, and contextual references are reviewed by default.
+- The LLM decision must be `keep`, `replace`, or `uncertain`.
+- A replacement is applied only when `decision=replace`, confidence is at least `0.85`, and `replacement_key` is one of the allowed keys.
 - The raw speaker key should be preserved as metadata for audit and human review.
-- Deterministic text integrity validation must still pass after key normalization.
+- Deterministic text integrity validation must still pass after key review.
 
 Example:
 
@@ -356,13 +390,15 @@ Example:
 {
   "segment_id": "seg_000042",
   "source_span": {"start": 120, "end": 128},
-  "script": {"Harry Potter": "text"},
-  "raw_script_key": "The Boy Who Lived",
-  "speaker_key_normalization": {
-    "from": "The Boy Who Lived",
-    "to": "Harry Potter",
-    "source": "character_registry",
-    "confidence": 0.97
+  "script": {"安德鲁·马丁": "text"},
+  "raw_script_key": "马丁先生",
+  "speaker_key_review": {
+    "from": "马丁先生",
+    "to": "安德鲁·马丁",
+    "decision": "replace",
+    "confidence": 0.91,
+    "evidence": ["Stage 1 scene context locally maps 马丁先生 to 安德鲁·马丁."],
+    "review_notes": []
   },
   "confidence": 0.94,
   "review_notes": []
@@ -371,7 +407,17 @@ Example:
 
 ---
 
-# Stage 3 — Tone & Pause Annotator
+# Legacy Debug Step — Deterministic Speaker Key Normalizer
+
+The old deterministic `speaker-key-normalize` command is kept temporarily for debugging stable-alias registry behavior.
+
+It should not be part of the recommended production flow after Stage 3 unless explicitly requested.
+
+It may rename only clearly stable aliases and must never globally rename contextual references such as `马丁先生`, `先生`, `小先生`, `我的当事人`, role titles, pronouns, or descriptive phrases.
+
+---
+
+# Stage 4 — Tone & Pause Annotator
 
 ## Purpose
 
@@ -429,7 +475,7 @@ Return valid JSON only.
 
 ---
 
-# Stage 4 — Pronunciation & TTS Hint Generator
+# Stage 5 — Pronunciation & TTS Hint Generator
 
 ## Purpose
 
@@ -493,7 +539,7 @@ Return valid JSON only.
 
 ---
 
-# Stage 5 — Script Scrutinizer
+# Stage 6 — Script Scrutinizer
 
 ## Purpose
 
@@ -557,7 +603,9 @@ Chunk Context & Character Profiler
   |
 Script Converter
   |
-Speaker Key Normalizer
+Script Assembly
+  |
+Speaker Key Reviewer
   |
 Tone & Pause Annotator
   |
