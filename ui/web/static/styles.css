@@ -1,14 +1,15 @@
 :root {
   color-scheme: light;
-  --bg: #f7f7f4;
+  --bg: #f6f7f7;
   --panel: #ffffff;
-  --text: #1f2528;
-  --muted: #647075;
-  --line: #d7dddf;
+  --text: #202629;
+  --muted: #657277;
+  --line: #d8dee1;
   --accent: #176b87;
   --accent-strong: #0f4c5c;
   --danger: #b42318;
   --danger-bg: #fff0ed;
+  --ok: #20744a;
 }
 
 * {
@@ -26,9 +27,7 @@ body {
 header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 24px;
-  min-height: 72px;
+  min-height: 76px;
   padding: 16px 24px;
   border-bottom: 1px solid var(--line);
   background: var(--panel);
@@ -37,12 +36,16 @@ header {
 h1 {
   margin: 0;
   font-size: 22px;
-  font-weight: 700;
 }
 
-nav {
-  display: flex;
-  gap: 8px;
+header p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+main {
+  padding: 16px 20px 20px;
 }
 
 button,
@@ -57,7 +60,7 @@ input {
 }
 
 button {
-  padding: 0 14px;
+  padding: 0 13px;
   cursor: pointer;
 }
 
@@ -71,37 +74,7 @@ button.primary:hover {
   background: var(--accent-strong);
 }
 
-.tab {
-  min-width: 96px;
-}
-
-.tab.active {
-  border-color: var(--accent);
-  color: var(--accent-strong);
-  font-weight: 700;
-}
-
-main {
-  padding: 18px 24px 24px;
-}
-
-.tab-panel {
-  display: none;
-}
-
-.tab-panel.active {
-  display: block;
-}
-
-.toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 14px;
-}
-
-.toolbar label {
+label {
   display: grid;
   gap: 4px;
   color: var(--muted);
@@ -110,24 +83,59 @@ main {
   text-transform: uppercase;
 }
 
-.toolbar select {
-  min-width: 240px;
+select,
+input {
+  min-width: 180px;
+  padding: 0 9px;
+  text-transform: none;
 }
 
-.toolbar input {
-  width: 220px;
-  padding: 0 10px;
+.context-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.context-bar #source-select {
+  min-width: 260px;
+}
+
+.context-bar #project-id {
+  width: 210px;
+}
+
+progress {
+  width: 160px;
+  height: 14px;
+  margin-bottom: 11px;
+}
+
+.status {
+  min-height: 20px;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.status.error {
+  color: var(--danger);
 }
 
 .workspace {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 16px;
-  height: calc(100vh - 162px);
-  min-height: 520px;
+  gap: 14px;
+  height: calc(100vh - 176px);
+  min-height: 560px;
 }
 
-.pane {
+.panel {
   display: flex;
   min-width: 0;
   flex-direction: column;
@@ -137,37 +145,84 @@ main {
   background: var(--panel);
 }
 
-.pane-header {
+.panel-toolbar {
   display: flex;
-  align-items: center;
+  align-items: end;
   justify-content: space-between;
   gap: 12px;
-  min-height: 48px;
-  padding: 10px 14px;
+  min-height: 58px;
+  padding: 10px 12px;
   border-bottom: 1px solid var(--line);
 }
 
-.pane-header h2 {
-  margin: 0;
-  font-size: 15px;
+.panel-toolbar label {
+  flex: 1;
 }
 
-.status {
+.panel-toolbar select {
+  width: 100%;
+}
+
+.panel-content {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+}
+
+.panel-actions {
+  position: sticky;
+  top: -12px;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 10px;
+  margin: -12px -12px 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  background: #fbfcfc;
+}
+
+.panel-action-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 10px;
+}
+
+.panel-actions select {
+  min-width: 220px;
+}
+
+.panel-actions progress {
+  width: 140px;
+}
+
+.panel-job-status {
+  margin-bottom: 8px;
+}
+
+.meta-bar {
+  position: sticky;
+  top: -12px;
+  z-index: 1;
+  margin: -12px -12px 12px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  background: #fbfcfc;
   color: var(--muted);
   font-size: 13px;
 }
 
-.status.error {
-  color: var(--danger);
-}
-
-.text-view,
-.chunk-list,
-.script-list {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-  padding: 14px;
+.empty-state {
+  display: grid;
+  min-height: 160px;
+  place-items: center;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  text-align: center;
 }
 
 pre {
@@ -179,49 +234,74 @@ pre {
   line-height: 1.6;
 }
 
+.text-block {
+  padding: 2px;
+}
+
 .chunk-card,
+.character-card,
+.info-card,
+.timeline-card,
 .segment {
+  margin-bottom: 12px;
   padding: 12px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  margin-bottom: 12px;
   background: #fff;
 }
 
-.chunk-card h3 {
-  margin: 0 0 4px;
+.chunk-card h3,
+.character-card h3,
+.info-card h3,
+.timeline-card h3 {
+  margin: 0 0 8px;
   font-size: 14px;
 }
 
-.chunk-card p {
-  margin: 0 0 10px;
+.timeline-card h4 {
+  margin: 10px 0 5px;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.info-card p,
+.timeline-section p,
+.field-line,
+.muted {
+  margin: 0 0 8px;
   color: var(--muted);
   font-size: 13px;
+  line-height: 1.45;
 }
 
-.split-left {
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+.info-card p {
+  color: var(--text);
+}
+
+.timeline-section p {
+  color: var(--text);
+}
+
+ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+li {
+  margin: 0 0 6px;
+  line-height: 1.45;
+}
+
+.link-button {
+  height: auto;
   min-height: 0;
-}
-
-.chunk-chooser {
-  max-height: 170px;
-  overflow: auto;
-  padding: 10px;
-  border-bottom: 1px solid var(--line);
-}
-
-.chunk-row {
-  display: block;
-  width: 100%;
-  margin-bottom: 8px;
+  border: 0;
+  background: transparent;
+  color: var(--accent-strong);
+  font-weight: 700;
+  padding: 0;
   text-align: left;
-}
-
-progress {
-  width: 180px;
-  height: 14px;
 }
 
 .speaker {
@@ -232,8 +312,13 @@ progress {
   text-transform: uppercase;
 }
 
+.segment.passed {
+  border-left: 3px solid var(--ok);
+}
+
 .segment.failed {
   border-color: #ffb4a8;
+  border-left: 3px solid var(--danger);
   background: var(--danger-bg);
 }
 
@@ -247,11 +332,18 @@ progress {
   font-size: 12px;
 }
 
-@media (max-width: 900px) {
-  header,
-  .toolbar {
+@media (max-width: 980px) {
+  .context-bar {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .context-bar select,
+  .context-bar input,
+  .context-bar #source-select,
+  .context-bar #chunk-select {
+    width: 100%;
+    min-width: 0;
   }
 
   .workspace {
@@ -259,8 +351,7 @@ progress {
     height: auto;
   }
 
-  .pane {
-    min-height: 460px;
+  .panel {
+    min-height: 520px;
   }
 }
-

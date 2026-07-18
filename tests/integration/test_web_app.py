@@ -9,6 +9,81 @@ from storage.workspace import Workspace
 from ui.web.app import create_app
 
 
+def _wait_for_job(client: TestClient, job_id: str) -> dict:
+    status = {}
+    for _ in range(30):
+        status = client.get(f"/api/jobs/{job_id}").json()
+        if status["status"] in {"complete", "failed"}:
+            break
+        time.sleep(0.05)
+    return status
+
+
+def _write_stage1_response(path: Path, scene_summary: str = "安德鲁正在说话。") -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "context": {
+                    "scene_summary": scene_summary,
+                    "active_characters": ["安德鲁"],
+                    "aliases_observed": [],
+                    "current_emotional_state": {},
+                    "unresolved_pronouns": [],
+                    "important_context": ["开场对话。"],
+                    "confidence": 0.92,
+                    "review_notes": [],
+                },
+                "character_registry_updates": [
+                    {
+                        "character_id": "character_001",
+                        "canonical_name": "安德鲁",
+                        "stable_aliases": ["安德鲁"],
+                        "contextual_references": [],
+                        "alias_evidence": [],
+                        "persona_summary": "平静。",
+                        "speaking_style": "礼貌。",
+                        "age_impression": None,
+                        "voice_variant_notes": [],
+                        "confidence": 0.95,
+                        "review_notes": [],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_stage2_response(path: Path, source_text: str) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "segments": [
+                    {"script": {"narrator": source_text}, "confidence": 0.99},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_web_template_keeps_actions_panel_owned() -> None:
+    template = Path("ui/web/templates/index.html").read_text(encoding="utf-8")
+    script = Path("ui/web/static/app.js").read_text(encoding="utf-8")
+
+    assert 'id="chunk-button"' not in template
+    assert 'id="chunk-select"' not in template
+    assert 'id="stage2-button"' not in template
+    assert 'id="source-select"' in template
+    assert 'id="project-id"' in template
+    assert "chunk it" in script
+    assert "overview chunks" in script
+    assert "feed to LLM" in script
+    assert 'all.textContent = "all"' in script
+
+
 def test_web_api_lists_loads_and_chunks_source(tmp_path: Path) -> None:
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()
@@ -36,12 +111,77 @@ def test_web_api_lists_loads_and_chunks_source(tmp_path: Path) -> None:
     chunks = client.get("/api/projects/fixture_project/chunks").json()
     assert chunks["chunks"][0]["text"] == "第一段。\nSecond paragraph.\n"
 
+    options = client.get("/api/projects/fixture_project/artifact-options").json()
+    assert [option["id"] for option in options["views"]] == [
+        "original_text",
+        "chunks",
+        "scene_summary",
+        "character_summary",
+        "scripts",
+    ]
 
-def test_web_stage2_job_and_script_endpoint(tmp_path: Path) -> None:
+    original_view = client.get(
+        "/api/projects/fixture_project/views/original_text",
+        params={"source_path": sources[0]["path"]},
+    ).json()
+    assert original_view["available"] is True
+    assert original_view["source"]["text"] == "第一段。\nSecond paragraph.\n"
+
+    chunks_view = client.get("/api/projects/fixture_project/views/chunks").json()
+    assert chunks_view["available"] is True
+    assert chunks_view["chunks"][0]["chunk_id"] == "chunk_0001"
+
+    empty_context = client.get(
+        "/api/projects/fixture_project/views/scene_summary"
+    ).json()
+    assert empty_context["available"] is False
+
+
+def test_web_stage1_overview_job_processes_all_chunks(tmp_path: Path) -> None:
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()
     source = raw_dir / "tiny.txt"
     source.write_text("他说，“你好。”\n她点头。", encoding="utf-8")
+    response_dir = tmp_path / "stage1_responses"
+    response_dir.mkdir()
+    _write_stage1_response(response_dir / "chunk_0001_response.json")
+
+    app = create_app(raw_dir=raw_dir, workspace_root=tmp_path / "interim")
+    client = TestClient(app)
+    client.post(
+        "/api/chunk",
+        json={"source_path": str(source), "project_id": "fixture_project"},
+    )
+
+    job = client.post(
+        "/api/stage1/jobs",
+        json={
+            "project_id": "fixture_project",
+            "response_dir": str(response_dir),
+        },
+    ).json()
+    status = _wait_for_job(client, job["job_id"])
+
+    assert status["phase"] == "stage1"
+    assert status["status"] == "complete"
+    assert status["completed_chunks"] == 1
+
+    scene = client.get("/api/projects/fixture_project/views/scene_summary").json()
+    assert scene["available"] is True
+    assert scene["sections"][0]["scene_summary"] == "安德鲁正在说话。"
+
+    characters = client.get(
+        "/api/projects/fixture_project/views/character_summary"
+    ).json()
+    assert characters["characters"][0]["canonical_name"] == "安德鲁"
+
+
+def test_web_stage2_selected_chunk_job_and_script_endpoint(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    source = raw_dir / "tiny.txt"
+    source_text = "他说，“你好。”\n她点头。"
+    source.write_text(source_text, encoding="utf-8")
     response = tmp_path / "response.json"
     response.write_text(
         json.dumps(
@@ -67,20 +207,14 @@ def test_web_stage2_job_and_script_endpoint(tmp_path: Path) -> None:
         "/api/stage2/jobs",
         json={
             "project_id": "fixture_project",
-            "chunk_id": "chunk_0001",
+            "selection": "chunk_0001",
             "response_path": str(response),
         },
     ).json()
-
-    status = job
-    for _ in range(20):
-        status = client.get(f"/api/stage2/jobs/{job['job_id']}").json()
-        if status["status"] in {"complete", "failed"}:
-            break
-        time.sleep(0.05)
+    status = _wait_for_job(client, job["job_id"])
 
     assert status["status"] == "complete"
-    assert status["processed_windows"] == 1
+    assert status["completed_chunks"] == 1
 
     script = client.get("/api/projects/fixture_project/script/chunk_0001").json()
     assert script["validation_report"]["exact_reconstruction_success"] is True
@@ -89,6 +223,43 @@ def test_web_stage2_job_and_script_endpoint(tmp_path: Path) -> None:
         "passed",
         "passed",
     ]
+
+
+def test_web_stage2_all_job_assembles_continuous_script(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    source = raw_dir / "tiny.txt"
+    source_text = "他说你好。"
+    source.write_text(source_text, encoding="utf-8")
+    response_dir = tmp_path / "stage2_responses"
+    response_dir.mkdir()
+    _write_stage2_response(response_dir / "chunk_0001_response.json", source_text)
+    app = create_app(raw_dir=raw_dir, workspace_root=tmp_path / "interim")
+    client = TestClient(app)
+    client.post(
+        "/api/chunk",
+        json={"source_path": str(source), "project_id": "fixture_project"},
+    )
+
+    job = client.post(
+        "/api/stage2/jobs",
+        json={
+            "project_id": "fixture_project",
+            "selection": "all",
+            "response_dir": str(response_dir),
+        },
+    ).json()
+    status = _wait_for_job(client, job["job_id"])
+
+    assert status["phase"] == "stage2"
+    assert status["status"] == "complete"
+    assert status["completed_chunks"] == 1
+    assert status["artifact_path"].endswith("complete_script.json")
+
+    scripts = client.get("/api/projects/fixture_project/views/scripts").json()
+    assert scripts["script_source"] == "continuous"
+    assert scripts["selected_chunk_id"] == "complete"
+    assert scripts["segments"][0]["text"] == source_text
 
 
 def test_script_endpoint_marks_bad_segment_red_payload(tmp_path: Path) -> None:
@@ -141,3 +312,106 @@ def test_script_endpoint_marks_bad_segment_red_payload(tmp_path: Path) -> None:
     assert "script text does not match source span" in "; ".join(
         script["segments"][0]["validation_errors"]
     )
+
+
+def test_panel_views_return_context_characters_and_scripts(tmp_path: Path) -> None:
+    app = create_app(raw_dir=tmp_path / "raw", workspace_root=tmp_path / "interim")
+    client = TestClient(app)
+    workspace = Workspace("fixture_project", root=tmp_path / "interim")
+    workspace.ensure()
+    chunk_path = workspace.chunk_text_path(0)
+    chunk_path.write_text("他说你好", encoding="utf-8")
+    write_json(
+        workspace.context_artifact_path("chunk_0001"),
+        {
+            "project_id": "fixture_project",
+            "chunk_id": "chunk_0001",
+            "llm_provider": "test",
+            "llm_model": "test",
+            "response_source": "response_path",
+            "context": {
+                "scene_summary": "安德鲁说话。",
+                "active_characters": ["安德鲁"],
+                "aliases_observed": [],
+                "current_emotional_state": {},
+                "unresolved_pronouns": [],
+                "important_context": ["开场对话。"],
+                "confidence": 0.9,
+                "review_notes": [],
+            },
+            "character_registry_updates": [],
+        },
+    )
+    write_json(
+        workspace.character_registry_path,
+        {
+            "project_id": "fixture_project",
+            "characters": [
+                {
+                    "character_id": "character_001",
+                    "canonical_name": "安德鲁",
+                    "stable_aliases": ["安德鲁"],
+                    "contextual_references": [],
+                    "aliases": [],
+                    "alias_evidence": [],
+                    "persona_summary": "平静。",
+                    "speaking_style": "礼貌。",
+                    "age_impression": None,
+                    "voice_variant_notes": [],
+                    "confidence": 0.9,
+                    "review_notes": [],
+                }
+            ],
+        },
+    )
+    write_json(
+        workspace.script_artifact_path("chunk_0001"),
+        {
+            "project_id": "fixture_project",
+            "chunk_id": "chunk_0001",
+            "chunk_source_path": str(chunk_path),
+            "chunk_sha256": "unused",
+            "llm_provider": "test",
+            "llm_model": "test",
+            "response_source": "response_path",
+            "processed_chunk_count": 1,
+            "segments": [
+                {
+                    "segment_id": "seg_000001",
+                    "source_span": {"start": 0, "end": 4},
+                    "script": {"安德鲁": "他说你好"},
+                    "raw_script_key": None,
+                    "speaker_key_normalization": None,
+                    "confidence": 0.9,
+                    "review_notes": [],
+                }
+            ],
+        },
+    )
+    write_json(
+        workspace.script_validation_report_path("chunk_0001"),
+        {
+            "project_id": "fixture_project",
+            "chunk_id": "chunk_0001",
+            "exact_reconstruction_success": True,
+            "segment_count": 1,
+            "source_character_count": 4,
+            "reconstructed_character_count": 4,
+            "source_hash": "unused",
+            "reconstructed_hash": "unused",
+            "errors": [],
+        },
+    )
+
+    scene = client.get("/api/projects/fixture_project/views/scene_summary").json()
+    assert scene["available"] is True
+    assert scene["sections"][0]["scene_summary"] == "安德鲁说话。"
+
+    characters = client.get(
+        "/api/projects/fixture_project/views/character_summary"
+    ).json()
+    assert characters["characters"][0]["canonical_name"] == "安德鲁"
+
+    scripts = client.get("/api/projects/fixture_project/views/scripts").json()
+    assert scripts["script_source"] == "single_chunk"
+    assert scripts["segments"][0]["validation_status"] == "passed"

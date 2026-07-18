@@ -167,10 +167,6 @@ Everything should communicate through well-defined data models.
 
 ## Current Development Scope
 
-Ignore the webapp for now.
-
-Do not work on `/ui/web`, FastAPI routes, browser templates, frontend assets, or local dashboard behavior unless the user explicitly asks for webapp work.
-
 When making pipeline changes, first identify the pipeline stage being discussed. State the stage in your working notes or final response, then inspect and modify only code, prompts, tests, and documentation that are directly relevant to that stage.
 
 Whenever implementing or changing a pipeline stage, update `README.md` with the latest terminal command that runs the implemented stage or stages. The README command should match the current CLI/module entry point and required arguments.
