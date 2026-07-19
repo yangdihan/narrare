@@ -230,6 +230,59 @@ The final key-reviewed script is written to:
 data/interim/$PROJECT_ID/ir/script/complete_key_reviewed_script.json
 ```
 
+## Stage 4: Qwen TTS And Audio Takes
+
+Bootstrap Qwen TTS once from the restored source folder. This copies the Qwen
+package source into `tts/qwen/vendor/`, the 1.7B Base model into
+`data/models/qwen/`, existing prompts and samples into `data/voices/qwen/`, and
+writes a manifest:
+
+```bash
+.venv/bin/python -m cli.main qwen-bootstrap \
+  --source Qwen3-Audiobook-Studio-v1.0-lite \
+  --model Qwen3-TTS-12Hz-1.7B-Base
+```
+
+Create a new Qwen `.pt` voice prompt from a `.wav` or `.m4a` sample and its
+matching transcript:
+
+```bash
+.venv/bin/python -m cli.main voice-prompt-create \
+  --sample data/voices/qwen/samples/f语文老师上公开课了.m4a \
+  --text "<matching transcript>" \
+  --profile-id smoke_f_teacher
+```
+
+Generate one clip directly from text and a voice profile:
+
+```bash
+.venv/bin/python -m cli.main tts-generate \
+  --text "只要不违背第一条规则或第二条规则，机器人必须保护它自身的生存。" \
+  --voice-profile-id f语文老师上公开课了 \
+  --output data/interim/qwen_smoke/f语文老师上公开课了_preview.wav
+```
+
+Create one voice assignment slot for every unique speaker key in the complete
+script:
+
+```bash
+.venv/bin/python -m cli.main voice-assign-init --project-id "$PROJECT_ID"
+```
+
+After voice assignments are confirmed in the webapp, generate one audio take per
+script segment:
+
+```bash
+.venv/bin/python -m cli.main audio-generate --project-id "$PROJECT_ID"
+```
+
+Before deleting old Qwen folders, verify that copied package, model, prompt, and
+dependency paths are ready:
+
+```bash
+.venv/bin/python -m cli.main qwen-delete-check
+```
+
 ---
 
 # Future Roadmap

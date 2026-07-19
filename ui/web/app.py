@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -27,8 +27,18 @@ from core.pipeline.script_conversion import (
     ScriptProgress,
     run_script_conversion_workflow,
 )
+from core.pipeline.qwen_tts import qwen_delete_readiness_report
+from core.pipeline.voice_assignment import (
+    AudioGenerationProgress,
+    build_voice_assignment_view,
+    generate_voice_sample,
+    run_audio_generation_workflow,
+    save_voice_assignments,
+)
 from core.validation.script_integrity import normalize_content_text
 from storage.workspace import Workspace
+from tts.dummy import DummyTTSAdapter
+from tts.qwen.adapter import QwenTTSAdapter
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -38,7 +48,14 @@ VIEW_OPTIONS = [
     {"id": "scene_summary", "label": "Chunk Scene Summary"},
     {"id": "character_summary", "label": "Character Summary"},
     {"id": "scripts", "label": "Scripts"},
+    {"id": "voice_assignment", "label": "Voice Assignment"},
 ]
+
+VIEW_ALIASES = {
+    "voice-assignment": "voice_assignment",
+    "voice_assignments": "voice_assignment",
+    "voices": "voice_assignment",
+}
 
 
 class ChunkRequest(BaseModel):
@@ -61,6 +78,20 @@ class Stage2JobRequest(BaseModel):
     max_retries: int = 1
 
 
+class VoiceSampleRequest(BaseModel):
+    speaker: str
+    voice_profile_id: str
+
+
+class VoiceAssignmentRequest(BaseModel):
+    assignments: dict[str, str]
+
+
+class AudioGenerationJobRequest(BaseModel):
+    assignments: dict[str, str]
+    only_missing: bool = True
+
+
 @dataclass
 class PipelineJob:
     job_id: str
@@ -71,6 +102,7 @@ class PipelineJob:
     total_chunks: int = 0
     completed_chunks: int = 0
     current_chunk_id: str | None = None
+    current_speaker: str | None = None
     errors: list[str] = field(default_factory=list)
     artifact_paths: dict[str, str] = field(default_factory=dict)
 
@@ -88,6 +120,10 @@ class PipelineJob:
             "total_windows": self.total_chunks,
             "processed_windows": self.completed_chunks,
             "current_window_id": self.current_chunk_id,
+            "total_segments": self.total_chunks,
+            "completed_segments": self.completed_chunks,
+            "current_segment_id": self.current_chunk_id,
+            "current_speaker": self.current_speaker,
             "errors": self.errors,
             "artifact_paths": self.artifact_paths,
             "artifact_path": self.artifact_paths.get("script"),
@@ -124,11 +160,15 @@ def create_app(
     *,
     raw_dir: str | Path = "data/raw",
     workspace_root: str | Path = "data/interim",
+    voice_inventory_path: str | Path = "data/voices/qwen/voice_profiles.json",
+    tts_adapter_name: str | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Narrare Pipeline")
     app.state.raw_dir = Path(raw_dir)
     app.state.workspace_root = Path(workspace_root)
+    app.state.voice_inventory_path = Path(voice_inventory_path)
     app.state.jobs = JobRegistry()
+    app.state.tts_adapter_name = tts_adapter_name
 
     templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
     app.mount(
@@ -220,8 +260,7 @@ def create_app(
         chunk_id: str | None = None,
     ) -> dict[str, Any]:
         workspace = _workspace(request, project_id)
-        if view_type not in {option["id"] for option in VIEW_OPTIONS}:
-            raise HTTPException(status_code=404, detail="unknown view type")
+        view_type = _canonical_view_type(view_type)
 
         resolved_source_path = None
         if source_path:
@@ -239,6 +278,8 @@ def create_app(
             return _character_summary_view(workspace)
         if view_type == "scripts":
             return _scripts_view(workspace, chunk_id)
+        if view_type == "voice_assignment":
+            return _voice_assignment_view(request, workspace)
 
         raise HTTPException(status_code=404, detail="unknown view type")
 
@@ -334,6 +375,92 @@ def create_app(
             "project_id": project_id,
             **get_script_payload(workspace, chunk_id),
         }
+
+    @app.post("/api/projects/{project_id}/voice-samples")
+    def generate_voice_sample_endpoint(
+        request: Request,
+        project_id: str,
+        payload: VoiceSampleRequest,
+    ) -> dict[str, Any]:
+        _ensure_tts_generation_enabled(request)
+        try:
+            result = generate_voice_sample(
+                project_id,
+                payload.speaker,
+                payload.voice_profile_id,
+                workspace_root=_state_path(request, "workspace_root"),
+                voice_inventory_path=_state_path(request, "voice_inventory_path"),
+                adapter=_tts_adapter(request),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        workspace = _workspace(request, project_id)
+        assignment = next(
+            item for item in result.assignments if item.speaker == payload.speaker
+        )
+        return {
+            "project_id": project_id,
+            "speaker": payload.speaker,
+            "assignment": assignment.model_dump(),
+            "sample_url": _audio_url(workspace, assignment.sample_take_path),
+        }
+
+    @app.post("/api/projects/{project_id}/voice-assignments")
+    def save_voice_assignment_endpoint(
+        request: Request,
+        project_id: str,
+        payload: VoiceAssignmentRequest,
+    ) -> dict[str, Any]:
+        try:
+            result = save_voice_assignments(
+                project_id,
+                payload.assignments,
+                workspace_root=_state_path(request, "workspace_root"),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"project_id": project_id, "assignments": _assignment_payloads(result)}
+
+    @app.post("/api/projects/{project_id}/audio/jobs")
+    def start_audio_generation_job(
+        request: Request,
+        project_id: str,
+        payload: AudioGenerationJobRequest,
+    ) -> dict[str, Any]:
+        _ensure_tts_generation_enabled(request)
+        try:
+            save_voice_assignments(
+                project_id,
+                payload.assignments,
+                workspace_root=_state_path(request, "workspace_root"),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        registry: JobRegistry = request.app.state.jobs
+        job = registry.create(project_id, "tts", "all")
+        thread = threading.Thread(
+            target=_run_audio_generation_job,
+            args=(request.app, job.job_id, project_id, payload.only_missing),
+            daemon=True,
+        )
+        thread.start()
+        return job.to_dict()
+
+    @app.get("/api/projects/{project_id}/audio-file/{audio_path:path}")
+    def get_audio_file(
+        request: Request,
+        project_id: str,
+        audio_path: str,
+    ) -> FileResponse:
+        workspace = _workspace(request, project_id)
+        audio_root = workspace.audio_dir.resolve()
+        target = (audio_root / audio_path).resolve()
+        if audio_root not in target.parents and target != audio_root:
+            raise HTTPException(status_code=400, detail="audio path escapes project")
+        if not target.exists() or target.suffix.lower() != ".wav":
+            raise HTTPException(status_code=404, detail="audio file not found")
+        return FileResponse(target, media_type="audio/wav")
 
     return app
 
@@ -524,6 +651,57 @@ def _run_stage2_job(
         registry.update(job_id, fail)
 
 
+def _run_audio_generation_job(
+    app: FastAPI,
+    job_id: str,
+    project_id: str,
+    only_missing: bool,
+) -> None:
+    registry: JobRegistry = app.state.jobs
+    workspace_root: Path = app.state.workspace_root
+
+    def on_progress(progress: AudioGenerationProgress) -> None:
+        def update(job: PipelineJob) -> None:
+            job.status = progress.status
+            job.total_chunks = progress.total_segments
+            job.completed_chunks = progress.completed_segments
+            job.current_chunk_id = progress.current_segment_id
+            job.current_speaker = progress.current_speaker
+            job.errors = progress.errors
+
+        registry.update(job_id, update)
+
+    try:
+        result = run_audio_generation_workflow(
+                project_id,
+                workspace_root=workspace_root,
+                voice_inventory_path=app.state.voice_inventory_path,
+                only_missing=only_missing,
+                adapter=_app_tts_adapter(app),
+            progress_callback=on_progress,
+        )
+
+        def complete(job: PipelineJob) -> None:
+            job.status = "complete"
+            job.current_chunk_id = None
+            job.current_speaker = None
+            job.errors = list(result.get("errors", []))
+            job.artifact_paths = {"audio_takes_dir": str(result["audio_takes_dir"])}
+
+        registry.update(job_id, complete)
+    except Exception as exc:
+        error_message = str(exc)
+
+        def fail(job: PipelineJob) -> None:
+            job.status = "failed"
+            if not job.errors:
+                job.errors = [error_message]
+            job.current_chunk_id = None
+            job.current_speaker = None
+
+        registry.update(job_id, fail)
+
+
 def _chunks_response(workspace: Workspace) -> dict[str, Any]:
     artifact = _read_json(workspace.chunks_path)
     report = (
@@ -661,6 +839,30 @@ def _scripts_view(
         "requested_chunk_id": chunk_id,
         "script_options": _script_options(workspace),
         **continuous_payload,
+    }
+
+
+def _voice_assignment_view(request: Request, workspace: Workspace) -> dict[str, Any]:
+    try:
+        view = build_voice_assignment_view(
+            workspace.project_id,
+            workspace_root=_state_path(request, "workspace_root"),
+            voice_inventory_path=_state_path(request, "voice_inventory_path"),
+        )
+    except RuntimeError as exc:
+        return _empty_view(workspace.project_id, "voice_assignment", str(exc))
+
+    return {
+        "project_id": workspace.project_id,
+        "view_type": "voice_assignment",
+        "available": True,
+        "tts_generation_enabled": _tts_generation_enabled(request),
+        "tts_generation_status": _tts_generation_status(request),
+        "script_artifact_path": str(view.script_artifact_path),
+        "voice_inventory_path": str(view.inventory_path),
+        "voice_profiles": view.voice_profiles,
+        "missing_voice_profile_ids": view.missing_voice_profile_ids,
+        "assignments": _assignment_payloads(view.assignments, workspace=workspace),
     }
 
 
@@ -906,6 +1108,76 @@ def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _canonical_view_type(view_type: str) -> str:
+    normalized = VIEW_ALIASES.get(view_type, view_type)
+    if normalized not in {option["id"] for option in VIEW_OPTIONS}:
+        raise HTTPException(status_code=404, detail="unknown view type")
+    return normalized
+
+
+def _assignment_payloads(
+    artifact,
+    *,
+    workspace: Workspace | None = None,
+) -> list[dict[str, Any]]:
+    output = []
+    for assignment in artifact.assignments:
+        payload = assignment.model_dump()
+        payload["sample_url"] = (
+            _audio_url(workspace, assignment.sample_take_path)
+            if workspace is not None
+            else None
+        )
+        output.append(payload)
+    return output
+
+
+def _audio_url(workspace: Workspace, path: str | None) -> str | None:
+    if not path:
+        return None
+    target = Path(path)
+    if not target.is_absolute():
+        target = (Path.cwd() / target).resolve()
+    audio_root = workspace.audio_dir.resolve()
+    try:
+        relative = target.resolve().relative_to(audio_root)
+    except ValueError:
+        return None
+    return (
+        f"/api/projects/{workspace.project_id}/audio-file/"
+        f"{relative.as_posix()}"
+    )
+
+
+def _ensure_tts_generation_enabled(request: Request) -> None:
+    if _tts_generation_enabled(request):
+        return
+    raise HTTPException(
+        status_code=409,
+        detail="Qwen web generation is disabled until CLI smoke tests pass.",
+    )
+
+
+def _tts_generation_enabled(request: Request) -> bool:
+    if request.app.state.tts_adapter_name == "dummy":
+        return True
+    report = qwen_delete_readiness_report(
+        voice_inventory_path=_state_path(request, "voice_inventory_path")
+    )
+    return bool(report["safe_to_delete_qwen_folders"])
+
+
+def _tts_generation_status(request: Request) -> str:
+    if request.app.state.tts_adapter_name == "dummy":
+        return "ready"
+    report = qwen_delete_readiness_report(
+        voice_inventory_path=_state_path(request, "voice_inventory_path")
+    )
+    if report["safe_to_delete_qwen_folders"]:
+        return "ready"
+    return "; ".join(report["notes"]) or "CLI smoke pending"
+
+
 def _view_available(
     workspace: Workspace,
     view_type: str,
@@ -922,7 +1194,20 @@ def _view_available(
         return workspace.character_registry_path.exists()
     if view_type == "scripts":
         return _continuous_script_payload(workspace) is not None
+    if view_type == "voice_assignment":
+        return _continuous_script_payload(workspace) is not None
     return False
+
+
+def _tts_adapter(request: Request):
+    return _app_tts_adapter(request.app)
+
+
+def _app_tts_adapter(app: FastAPI):
+    adapter_name = getattr(app.state, "tts_adapter_name", None)
+    if adapter_name == "dummy":
+        return DummyTTSAdapter()
+    return QwenTTSAdapter()
 
 
 def _stage2_selection(payload: Stage2JobRequest) -> str:

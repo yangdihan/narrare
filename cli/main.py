@@ -21,6 +21,20 @@ from core.pipeline.speaker_key_review import (
     SpeakerKeyReviewProgress,
     run_speaker_key_review_workflow,
 )
+from core.pipeline.qwen_tts import (
+    create_qwen_voice_prompt,
+    generate_qwen_clip,
+    qwen_delete_readiness_report,
+    run_qwen_bootstrap_workflow,
+)
+from core.pipeline.voice_assets import import_qwen_voice_assets
+from core.pipeline.voice_assignment import (
+    AudioGenerationProgress,
+    build_voice_assignment_artifact,
+    run_audio_generation_workflow,
+    save_voice_assignments,
+)
+from tts.qwen.paths import QWEN_DEFAULT_MODEL_ID
 
 
 def run_chunk_command(source_path: str, project_id: str) -> None:
@@ -147,6 +161,149 @@ def run_speaker_key_review_command(
         f"from {result.reviewed_count} reviewed candidates to "
         f"{result.workspace.key_reviewed_script_artifact_path('complete')}"
     )
+
+
+def run_voice_import_command(
+    prompt_source_dir: str,
+    sample_source_dirs: list[str],
+    voice_root: str,
+) -> None:
+    try:
+        result = import_qwen_voice_assets(
+            prompt_source_dir=prompt_source_dir,
+            sample_source_dirs=sample_source_dirs,
+            voice_root=voice_root,
+        )
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    sample_count = sum(1 for profile in result.profiles if profile.sample_path)
+    print(
+        f"Imported {len(result.profiles)} Qwen voice prompts and "
+        f"{sample_count} matched samples to {result.voice_root}/voice_profiles.json"
+    )
+
+
+def run_voice_assign_init_command(project_id: str) -> None:
+    try:
+        result = build_voice_assignment_artifact(project_id)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(
+        f"Wrote {len(result.assignments)} speaker voice assignment slots to "
+        f"data/interim/{project_id}/voice_assignments.json"
+    )
+
+
+def run_voice_assign_command(project_id: str, assignment_pairs: list[str]) -> None:
+    mapping = {}
+    for pair in assignment_pairs:
+        speaker, separator, profile_id = pair.partition("=")
+        if not separator or not speaker.strip() or not profile_id.strip():
+            raise SystemExit("assignments must use speaker=voice_profile_id form")
+        mapping[speaker.strip()] = profile_id.strip()
+    try:
+        result = save_voice_assignments(project_id, mapping)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    assigned_count = sum(1 for assignment in result.assignments if assignment.voice_profile_id)
+    print(
+        f"Saved {assigned_count}/{len(result.assignments)} voice assignments to "
+        f"data/interim/{project_id}/voice_assignments.json"
+    )
+
+
+def run_audio_generate_command(project_id: str, only_missing: bool) -> None:
+    renderer = AudioProgressRenderer(enabled=sys.stderr.isatty())
+    try:
+        result = run_audio_generation_workflow(
+            project_id,
+            only_missing=only_missing,
+            progress_callback=renderer.update,
+        )
+    except RuntimeError as exc:
+        renderer.finish()
+        raise SystemExit(str(exc)) from exc
+    renderer.finish()
+    print(
+        f"Generated {result['generated_count']} audio takes "
+        f"({result['skipped_count']} skipped) under {result['audio_takes_dir']}"
+    )
+
+
+def run_qwen_bootstrap_command(source: str, model: str) -> None:
+    try:
+        result = run_qwen_bootstrap_workflow(source=source, model=model)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    manifest = result["manifest"]
+    status = result["status"]
+    print(f"Wrote Qwen bootstrap manifest to {result['manifest_path']}")
+    print(f"vendor_package_exists={status['vendor_package_exists']}")
+    print(f"model_exists={status['model_exists']} {status['model_path']}")
+    print(f"copied_package_files={manifest.copied_package_files}")
+    print(f"copied_model_files={manifest.copied_model_files}")
+    print(f"copied_voice_profiles={manifest.copied_voice_profiles}")
+    if manifest.missing_dependencies:
+        print("missing_dependencies=" + ",".join(manifest.missing_dependencies))
+
+
+def run_voice_prompt_create_command(
+    sample: str,
+    text: str,
+    profile_id: str,
+) -> None:
+    try:
+        result = create_qwen_voice_prompt(
+            sample_path=sample,
+            transcript=text,
+            profile_id=profile_id,
+        )
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(f"voice_profile_id={result['profile_id']}")
+    print(f"prompt_path={result['prompt_path']}")
+    print(f"voice_inventory_path={result['voice_inventory_path']}")
+
+
+def run_tts_generate_command(
+    text: str,
+    voice_profile_id: str,
+    output: str,
+    language: str,
+    device: str,
+) -> None:
+    try:
+        result = generate_qwen_clip(
+            text=text,
+            voice_profile_id=voice_profile_id,
+            output_path=output,
+            language=language,
+            device=device,
+        )
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(f"output_path={result['output_path']}")
+    print(f"manifest_path={result['manifest_path']}")
+    print(f"sample_rate={result['sample_rate']}")
+
+
+def run_qwen_delete_check_command() -> None:
+    report = qwen_delete_readiness_report()
+    print(
+        "safe_to_delete_qwen_folders="
+        f"{str(report['safe_to_delete_qwen_folders']).lower()}"
+    )
+    print(f"bootstrap_manifest_exists={report['bootstrap_manifest_exists']}")
+    print(f"voice_inventory_exists={report['voice_inventory_exists']}")
+    print(f"vendor_package_exists={report['vendor_package_exists']}")
+    print(f"model_exists={report['model_exists']} {report['model_path']}")
+    print(f"missing_dependencies={len(report['missing_dependencies'])}")
+    print(f"missing_prompt_files={len(report['missing_prompt_files'])}")
+    print(f"old_path_references={len(report['old_path_references'])}")
+    for reference in report["old_path_references"]:
+        print(f"old_path_reference: {reference}")
+    for note in report["notes"]:
+        print(f"note: {note}")
 
 
 class ScriptProgressRenderer:
@@ -304,6 +461,49 @@ class SpeakerKeyReviewProgressRenderer:
         )
 
 
+class AudioProgressRenderer:
+    def __init__(self, *, enabled: bool, width: int = 30) -> None:
+        self.enabled = enabled
+        self.width = width
+        self._last_line_length = 0
+        self._last_progress_key: tuple[str, str | None, int] | None = None
+
+    def update(self, progress: AudioGenerationProgress) -> None:
+        line = self._format(progress)
+        if self.enabled:
+            padding = max(0, self._last_line_length - len(line))
+            print("\r" + line + (" " * padding), end="", file=sys.stderr, flush=True)
+            self._last_line_length = len(line)
+            return
+
+        progress_key = (
+            progress.status,
+            progress.current_segment_id,
+            progress.completed_segments,
+        )
+        if progress_key != self._last_progress_key:
+            print(line, file=sys.stderr)
+            self._last_progress_key = progress_key
+
+    def finish(self) -> None:
+        if self.enabled and self._last_line_length:
+            print(file=sys.stderr)
+            self._last_line_length = 0
+
+    def _format(self, progress: AudioGenerationProgress) -> str:
+        total = max(progress.total_segments, 1)
+        processed = min(progress.completed_segments, total)
+        filled = int(self.width * processed / total)
+        bar = "#" * filled + "-" * (self.width - filled)
+        segment = progress.current_segment_id or "all"
+        speaker = progress.current_speaker or "n/a"
+        return (
+            f"[{bar}] stage=tts segment={segment} "
+            f"speaker={speaker} segments={processed}/{progress.total_segments} "
+            f"status={progress.status}"
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="narrare")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -378,6 +578,81 @@ def build_parser() -> argparse.ArgumentParser:
         help="Minimum confidence required to apply a replacement key.",
     )
 
+    voice_import_parser = subparsers.add_parser(
+        "voice-import",
+        help="Copy Qwen .pt voice prompts and source audio samples into data/voices/qwen.",
+    )
+    voice_import_parser.add_argument(
+        "--prompt-source-dir",
+        required=True,
+    )
+    voice_import_parser.add_argument(
+        "--sample-source-dir",
+        action="append",
+        default=["data/voices"],
+        help="Directory containing source .wav/.m4a/.mp3/.flac samples.",
+    )
+    voice_import_parser.add_argument("--voice-root", default="data/voices/qwen")
+
+    voice_assign_init_parser = subparsers.add_parser(
+        "voice-assign-init",
+        help="Create voice assignment slots from the complete script speaker keys.",
+    )
+    voice_assign_init_parser.add_argument("--project-id", required=True)
+
+    voice_assign_parser = subparsers.add_parser(
+        "voice-assign",
+        help="Save speaker=voice_profile_id assignments from the terminal.",
+    )
+    voice_assign_parser.add_argument("--project-id", required=True)
+    voice_assign_parser.add_argument("assignments", nargs="+")
+
+    audio_parser = subparsers.add_parser(
+        "audio-generate",
+        help="Generate one audio take per script segment from confirmed voice assignments.",
+    )
+    audio_parser.add_argument("--project-id", required=True)
+    audio_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Regenerate all takes instead of only missing take files.",
+    )
+
+    qwen_bootstrap_parser = subparsers.add_parser(
+        "qwen-bootstrap",
+        help="Copy required Qwen package, model, and voice assets into Narrare.",
+    )
+    qwen_bootstrap_parser.add_argument("--source", required=True)
+    qwen_bootstrap_parser.add_argument("--model", default=QWEN_DEFAULT_MODEL_ID)
+
+    voice_prompt_parser = subparsers.add_parser(
+        "voice-prompt-create",
+        help="Create a Qwen .pt voice prompt from a sample audio file and transcript.",
+    )
+    voice_prompt_parser.add_argument("--sample", required=True)
+    voice_prompt_parser.add_argument("--text", required=True)
+    voice_prompt_parser.add_argument("--profile-id", required=True)
+
+    tts_generate_parser = subparsers.add_parser(
+        "tts-generate",
+        help="Generate one Qwen TTS clip from text and a voice profile id.",
+    )
+    tts_generate_parser.add_argument("--text", required=True)
+    tts_generate_parser.add_argument("--voice-profile-id", required=True)
+    tts_generate_parser.add_argument("--output", required=True)
+    tts_generate_parser.add_argument("--language", default="Chinese")
+    tts_generate_parser.add_argument(
+        "--device",
+        choices=["auto", "cpu", "mps", "cuda"],
+        default="auto",
+        help="Qwen inference device. Use cpu if Apple MPS crashes.",
+    )
+
+    subparsers.add_parser(
+        "qwen-delete-check",
+        help="Check whether old Qwen folders are safe to delete.",
+    )
+
     return parser
 
 
@@ -419,6 +694,48 @@ def main(argv: list[str] | None = None) -> None:
             args.response_dir,
             args.confidence_threshold,
         )
+        return
+
+    if args.command == "voice-import":
+        run_voice_import_command(
+            args.prompt_source_dir,
+            args.sample_source_dir,
+            args.voice_root,
+        )
+        return
+
+    if args.command == "voice-assign-init":
+        run_voice_assign_init_command(args.project_id)
+        return
+
+    if args.command == "voice-assign":
+        run_voice_assign_command(args.project_id, args.assignments)
+        return
+
+    if args.command == "audio-generate":
+        run_audio_generate_command(args.project_id, only_missing=not args.all)
+        return
+
+    if args.command == "qwen-bootstrap":
+        run_qwen_bootstrap_command(args.source, args.model)
+        return
+
+    if args.command == "voice-prompt-create":
+        run_voice_prompt_create_command(args.sample, args.text, args.profile_id)
+        return
+
+    if args.command == "tts-generate":
+        run_tts_generate_command(
+            args.text,
+            args.voice_profile_id,
+            args.output,
+            args.language,
+            args.device,
+        )
+        return
+
+    if args.command == "qwen-delete-check":
+        run_qwen_delete_check_command()
         return
 
     parser.error(f"Unknown command: {args.command}")

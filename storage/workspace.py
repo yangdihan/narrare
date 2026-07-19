@@ -9,11 +9,16 @@ class Workspace:
         self.chunks_dir = self.project_root / "chunks"
         self.context_ir_dir = self.project_root / "ir" / "context"
         self.script_ir_dir = self.project_root / "ir" / "script"
+        self.audio_dir = self.project_root / "audio"
+        self.audio_takes_dir = self.audio_dir / "takes"
+        self.voice_samples_dir = self.audio_dir / "voice_samples"
 
     def ensure(self) -> None:
         self.chunks_dir.mkdir(parents=True, exist_ok=True)
         self.context_ir_dir.mkdir(parents=True, exist_ok=True)
         self.script_ir_dir.mkdir(parents=True, exist_ok=True)
+        self.audio_takes_dir.mkdir(parents=True, exist_ok=True)
+        self.voice_samples_dir.mkdir(parents=True, exist_ok=True)
 
     @property
     def source_manifest_path(self) -> Path:
@@ -30,6 +35,22 @@ class Workspace:
     @property
     def character_registry_path(self) -> Path:
         return self.project_root / "characters.json"
+
+    @property
+    def voice_assignments_path(self) -> Path:
+        return self.project_root / "voice_assignments.json"
+
+    def voice_sample_path(self, speaker_key: str) -> Path:
+        return self.voice_samples_dir / f"{_safe_path_stem(speaker_key)}.wav"
+
+    def audio_take_dir(self, segment_id: str) -> Path:
+        return self.audio_takes_dir / segment_id
+
+    def audio_take_path(self, segment_id: str, take_number: int = 1) -> Path:
+        return self.audio_take_dir(segment_id) / f"take_{take_number:04d}.wav"
+
+    def audio_take_manifest_path(self, segment_id: str, take_number: int = 1) -> Path:
+        return self.audio_take_dir(segment_id) / f"take_{take_number:04d}.json"
 
     def chunk_text_path(self, index: int) -> Path:
         return self.chunks_dir / f"chunk_{index + 1:04d}.txt"
@@ -106,3 +127,11 @@ class Workspace:
             self.script_chunk_dir(chunk_id)
             / f"attempt_{attempt:02d}_repair_{repair_attempt:02d}_validation_report.json"
         )
+
+
+def _safe_path_stem(value: str) -> str:
+    cleaned = "".join(
+        char if char.isalnum() or char in {"-", "_"} else "_"
+        for char in value.strip()
+    )
+    return cleaned.strip("_") or "speaker"

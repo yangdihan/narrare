@@ -16,3 +16,5 @@ build/
 *.egg-info/
 __pycache__/
 *.py[cod]
+ui/web/templates/Untitled
+tts/qwen/vendor/*.dist-info/

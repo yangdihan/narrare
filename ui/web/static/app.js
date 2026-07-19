@@ -4,11 +4,14 @@ const VIEW_OPTIONS = [
   ["scene_summary", "Chunk Scene Summary"],
   ["character_summary", "Character Summary"],
   ["scripts", "Scripts"],
+  ["voice_assignment", "Voice Assignment"],
 ];
+
+const DEFAULT_PROJECT_ID = "bicentennial_man";
 
 const state = {
   sourcePath: "",
-  projectId: "",
+  projectId: DEFAULT_PROJECT_ID,
   chunkSelection: "all",
   currentJobId: "",
   currentJobOwner: "",
@@ -17,6 +20,7 @@ const state = {
     left: "original_text",
     right: "scripts",
   },
+  voiceAssignments: {},
 };
 
 const el = (id) => document.getElementById(id);
@@ -78,7 +82,7 @@ async function loadSource(path) {
   if (!path) return;
   const data = await api(`/api/source?path=${encodeURIComponent(path)}`);
   state.sourcePath = data.path;
-  state.projectId = data.default_project_id;
+  state.projectId = el("project-id").value.trim() || state.projectId || DEFAULT_PROJECT_ID;
   state.chunkSelection = "all";
   el("project-id").value = state.projectId;
   setStatus("global-status", `${data.character_count} source characters loaded`);
@@ -151,10 +155,12 @@ async function pollJob() {
 }
 
 function renderJobStatus(job) {
-  const total = job.total_chunks || 0;
-  const completed = job.completed_chunks || 0;
-  const current = job.current_chunk_id ? ` · ${job.current_chunk_id}` : "";
-  const message = `${job.phase} ${job.status}${current} · ${completed}/${total || "?"}`;
+  const total = job.total_segments || job.total_chunks || 0;
+  const completed = job.completed_segments || job.completed_chunks || 0;
+  const currentId = job.current_segment_id || job.current_chunk_id;
+  const current = currentId ? ` · ${currentId}` : "";
+  const speaker = job.current_speaker ? ` · ${job.current_speaker}` : "";
+  const message = `${job.phase} ${job.status}${current}${speaker} · ${completed}/${total || "?"}`;
   setStatus("global-status", message, job.status === "failed");
   setPanelJobStatus(state.currentJobOwner, message, completed, total || 1, job.status === "failed");
 }
@@ -199,6 +205,7 @@ function renderView(payload, panel) {
   if (payload.view_type === "scene_summary") return renderSceneSummary(payload);
   if (payload.view_type === "character_summary") return renderCharacters(payload);
   if (payload.view_type === "scripts") return renderScripts(payload);
+  if (payload.view_type === "voice_assignment") return renderVoiceAssignment(payload, panel);
   return emptyState("Unsupported view type.");
 }
 
@@ -378,6 +385,184 @@ function renderScripts(payload) {
   return fragment;
 }
 
+function renderVoiceAssignment(payload, panel) {
+  const fragment = document.createDocumentFragment();
+  state.voiceAssignments = {};
+  for (const assignment of payload.assignments) {
+    if (assignment.voice_profile_id) {
+      state.voiceAssignments[assignment.speaker] = assignment.voice_profile_id;
+    }
+  }
+  fragment.appendChild(
+    metaBar(
+      `${payload.assignments.length} speakers · ${payload.voice_profiles.length} voices · ${payload.script_artifact_path}`
+    )
+  );
+  if (!payload.tts_generation_enabled) {
+    const warning = cardNode("info-card warning-card");
+    const title = document.createElement("h3");
+    title.textContent = "TTS disabled";
+    const body = document.createElement("p");
+    body.textContent = payload.tts_generation_status || "CLI smoke pending";
+    warning.append(title, body);
+    fragment.appendChild(warning);
+  }
+  if (payload.missing_voice_profile_ids.length > 0) {
+    const warning = cardNode("info-card warning-card");
+    const title = document.createElement("h3");
+    title.textContent = "Missing assigned voices";
+    const body = document.createElement("p");
+    body.textContent = payload.missing_voice_profile_ids.join(", ");
+    warning.append(title, body);
+    fragment.appendChild(warning);
+  }
+  for (const assignment of payload.assignments) {
+    fragment.appendChild(voiceAssignmentCard(payload, assignment, panel));
+  }
+  fragment.appendChild(voiceAssignmentFooter(payload, panel));
+  return fragment;
+}
+
+function voiceAssignmentCard(payload, assignment, panel) {
+  const card = cardNode("voice-card");
+  card.dataset.speaker = assignment.speaker;
+
+  const header = document.createElement("div");
+  header.className = "voice-card-header";
+  const title = document.createElement("h3");
+  title.textContent = assignment.speaker;
+  const status = document.createElement("span");
+  status.className = "voice-status";
+  status.textContent = assignment.confirmed ? "assigned" : "unassigned";
+  header.append(title, status);
+
+  const summary = document.createElement("p");
+  summary.className = "muted";
+  summary.textContent = assignment.summary || "No character summary.";
+
+  const quoteLabel = document.createElement("p");
+  quoteLabel.className = "quote-label";
+  quoteLabel.textContent = "代表性的台词";
+  const quote = document.createElement("pre");
+  quote.className = "representative-line";
+  quote.textContent = assignment.representative_text || "No representative line.";
+
+  const controls = document.createElement("div");
+  controls.className = "voice-controls";
+  const label = document.createElement("label");
+  label.textContent = "Voice";
+  const select = document.createElement("select");
+  select.appendChild(new Option("Select voice", ""));
+  for (const profile of payload.voice_profiles) {
+    const option = new Option(profile.display_name, profile.profile_id);
+    option.disabled = !profile.available;
+    select.appendChild(option);
+  }
+  select.value = assignment.voice_profile_id || "";
+  select.disabled = !payload.tts_generation_enabled;
+  label.appendChild(select);
+
+  const audio = document.createElement("audio");
+  audio.controls = true;
+  audio.preload = "none";
+  if (assignment.sample_url) audio.src = assignment.sample_url;
+
+  const rowStatus = document.createElement("span");
+  rowStatus.className = "voice-row-status status";
+  if (!payload.tts_generation_enabled) {
+    rowStatus.textContent = "CLI smoke pending";
+  }
+
+  select.addEventListener("change", async (event) => {
+    if (!payload.tts_generation_enabled) return;
+    const profileId = event.target.value;
+    state.voiceAssignments[assignment.speaker] = profileId;
+    if (!profileId) {
+      status.textContent = "unassigned";
+      audio.removeAttribute("src");
+      rowStatus.textContent = "";
+      return;
+    }
+    status.textContent = "previewing";
+    rowStatus.textContent = "generating preview...";
+    try {
+      const result = await api(
+        `/api/projects/${encodeURIComponent(payload.project_id)}/voice-samples`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            speaker: assignment.speaker,
+            voice_profile_id: profileId,
+          }),
+        }
+      );
+      audio.src = `${result.sample_url}?t=${Date.now()}`;
+      audio.load();
+      status.textContent = "assigned";
+      rowStatus.textContent = "preview ready";
+    } catch (error) {
+      status.textContent = "preview failed";
+      rowStatus.textContent = error.message;
+      rowStatus.classList.add("error");
+    }
+  });
+
+  controls.append(label, audio, rowStatus);
+  card.append(header, summary, quoteLabel, quote, controls);
+  return card;
+}
+
+function voiceAssignmentFooter(payload, panel) {
+  const footer = document.createElement("div");
+  footer.className = "voice-assignment-footer";
+  const progress = document.createElement("progress");
+  progress.id = `${panel}-job-progress`;
+  progress.value = 0;
+  progress.max = 1;
+  const status = document.createElement("span");
+  status.id = `${panel}-job-status`;
+  status.className = "status panel-job-status";
+  const button = document.createElement("button");
+  button.className = "primary";
+  button.type = "button";
+  button.textContent = "confirm voice assignment & generate";
+  button.disabled = !payload.tts_generation_enabled;
+  if (!payload.tts_generation_enabled) {
+    status.textContent = payload.tts_generation_status || "CLI smoke pending";
+  }
+  button.addEventListener("click", async () => {
+    if (!payload.tts_generation_enabled) return;
+    const missing = payload.assignments
+      .filter((assignment) => !state.voiceAssignments[assignment.speaker])
+      .map((assignment) => assignment.speaker);
+    if (missing.length > 0) {
+      status.textContent = `missing voices: ${missing.join(", ")}`;
+      status.classList.add("error");
+      return;
+    }
+    status.classList.remove("error");
+    status.textContent = "starting audio generation...";
+    try {
+      const job = await api(
+        `/api/projects/${encodeURIComponent(payload.project_id)}/audio/jobs`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            assignments: state.voiceAssignments,
+            only_missing: true,
+          }),
+        }
+      );
+      startPolling(job, panel);
+    } catch (error) {
+      status.textContent = error.message;
+      status.classList.add("error");
+    }
+  });
+  footer.append(button, progress, status);
+  return footer;
+}
+
 function emptyState(message) {
   const node = document.createElement("div");
   node.className = "empty-state";
@@ -486,6 +671,9 @@ document.addEventListener("DOMContentLoaded", () => {
     state.projectId = event.target.value.trim();
     state.chunkSelection = "all";
     await refreshPanels();
+  });
+  el("project-id").addEventListener("input", (event) => {
+    state.projectId = event.target.value.trim();
   });
   loadSources().catch((error) => setStatus("global-status", error.message, true));
 });
