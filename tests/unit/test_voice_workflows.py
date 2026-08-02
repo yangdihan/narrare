@@ -22,6 +22,7 @@ from storage.json_store import write_json
 from storage.workspace import Workspace
 from tts.base import SynthesisRequest, SynthesisResult
 from tts.dummy import DummyTTSAdapter
+from tts.qwen.adapter import QwenTTSAdapter, _resolve_device
 from tts.qwen.bootstrap import bootstrap_qwen_assets
 
 
@@ -193,6 +194,14 @@ def test_qwen_delete_readiness_ignores_source_only_old_paths(
 
     assert report["old_path_references"] == []
     assert report["safe_to_delete_qwen_folders"] is True
+
+
+def test_qwen_adapter_defaults_to_cpu_instead_of_mps(monkeypatch) -> None:
+    monkeypatch.delenv("NARRARE_QWEN_DEVICE", raising=False)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+
+    assert QwenTTSAdapter().device == "cpu"
+    assert _resolve_device("auto") == "cpu"
 
 
 class _PromptAdapter:

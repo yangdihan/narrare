@@ -83,6 +83,13 @@ def test_web_template_keeps_actions_panel_owned() -> None:
     assert "chunk it" in script
     assert "overview chunks" in script
     assert "feed to LLM" in script
+    assert "auto unify characters" in script
+    assert "generate sample" in script
+    assert "Rename" in script
+    assert "save edit" in script
+    assert "Original sample" in script
+    assert "Generated sample" in script
+    assert "sample-button" in script
     assert 'all.textContent = "all"' in script
 
 
@@ -265,6 +272,133 @@ def test_web_stage2_all_job_assembles_continuous_script(tmp_path: Path) -> None:
     assert scripts["segments"][0]["text"] == source_text
 
 
+def test_web_stage3_auto_unify_characters_job(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    source = raw_dir / "tiny.txt"
+    source.write_text("你好", encoding="utf-8")
+    app = create_app(raw_dir=raw_dir, workspace_root=tmp_path / "interim")
+    client = TestClient(app)
+    client.post(
+        "/api/chunk",
+        json={"source_path": str(source), "project_id": "fixture_project"},
+    )
+    workspace = Workspace("fixture_project", root=tmp_path / "interim")
+    write_json(
+        workspace.character_registry_path,
+        {
+            "project_id": "fixture_project",
+            "characters": [
+                {
+                    "character_id": "character_001",
+                    "canonical_name": "安德鲁·马丁",
+                    "stable_aliases": ["安德鲁"],
+                    "contextual_references": [],
+                    "aliases": ["安德鲁"],
+                    "alias_evidence": [],
+                    "persona_summary": "平静。",
+                    "speaking_style": "礼貌。",
+                    "age_impression": None,
+                    "voice_variant_notes": [],
+                    "confidence": 0.95,
+                    "review_notes": [],
+                }
+            ],
+        },
+    )
+    write_json(
+        workspace.context_artifact_path("chunk_0001"),
+        {
+            "project_id": "fixture_project",
+            "chunk_id": "chunk_0001",
+            "llm_provider": "test",
+            "llm_model": "test",
+            "response_source": "response_path",
+            "context": {
+                "scene_summary": "安德鲁说话。",
+                "active_characters": ["安德鲁·马丁"],
+                "aliases_observed": [
+                    {
+                        "text": "安德鲁",
+                        "reference_type": "stable_name",
+                        "likely_character_id": "character_001",
+                        "confidence": 0.99,
+                        "review_notes": [],
+                    }
+                ],
+                "current_emotional_state": {},
+                "unresolved_pronouns": [],
+                "important_context": [],
+                "confidence": 0.95,
+                "review_notes": [],
+            },
+            "character_registry_updates": [],
+        },
+    )
+    write_json(
+        workspace.script_artifact_path("complete"),
+        {
+            "project_id": "fixture_project",
+            "chunk_id": "complete",
+            "chunk_source_path": str(workspace.chunks_path),
+            "chunk_sha256": "unused",
+            "llm_provider": "test",
+            "llm_model": "test",
+            "response_source": "assembled",
+            "processed_chunk_count": 1,
+            "segments": [
+                {
+                    "segment_id": "seg_000001",
+                    "source_span": {"start": 0, "end": 2},
+                    "script": {"安德鲁": "你好"},
+                    "confidence": 0.9,
+                    "review_notes": [],
+                }
+            ],
+        },
+    )
+    response_dir = tmp_path / "stage3_responses"
+    response_dir.mkdir()
+    (response_dir / "seg_000001_response.json").write_text(
+        json.dumps(
+            {
+                "segment_id": "seg_000001",
+                "current_key": "安德鲁",
+                "decision": "replace",
+                "replacement_key": "安德鲁·马丁",
+                "confidence": 0.99,
+                "evidence": ["Unique stable alias match."],
+                "review_notes": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    scripts_before = client.get(
+        "/api/projects/fixture_project/views/scripts"
+    ).json()
+    assert scripts_before["stage3_enabled"] is True
+
+    job = client.post(
+        "/api/stage3/jobs",
+        json={
+            "project_id": "fixture_project",
+            "response_dir": str(response_dir),
+        },
+    ).json()
+    status = _wait_for_job(client, job["job_id"])
+
+    assert status["phase"] == "stage3"
+    assert status["status"] == "complete"
+    assert status["completed_segments"] == 1
+    assert status["artifact_path"].endswith("complete_key_reviewed_script.json")
+    scripts_after = client.get(
+        "/api/projects/fixture_project/views/scripts"
+    ).json()
+    assert scripts_after["segments"][0]["speaker"] == "安德鲁·马丁"
+
+
 def test_web_voice_assignment_view_preview_and_audio_job(tmp_path: Path) -> None:
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()
@@ -276,6 +410,9 @@ def test_web_voice_assignment_view_preview_and_audio_job(tmp_path: Path) -> None
     _write_stage2_response(response_dir / "chunk_0001_response.json", source_text)
     prompt = tmp_path / "voice.pt"
     prompt.write_bytes(b"prompt")
+    original_sample = tmp_path / "voices" / "voice_a.m4a"
+    original_sample.parent.mkdir()
+    original_sample.write_bytes(b"original sample")
     inventory_path = tmp_path / "voices" / "voice_profiles.json"
     write_json(
         inventory_path,
@@ -288,6 +425,8 @@ def test_web_voice_assignment_view_preview_and_audio_job(tmp_path: Path) -> None
                     display_name="Voice A",
                     prompt_path=str(prompt),
                     prompt_sha256="hash",
+                    sample_path="voice_a.m4a",
+                    sample_sha256="sample-hash",
                 )
             ],
         ),
@@ -318,6 +457,10 @@ def test_web_voice_assignment_view_preview_and_audio_job(tmp_path: Path) -> None
     assert view["available"] is True
     assert view["assignments"][0]["speaker"] == "narrator"
     assert view["assignments"][0]["representative_text"] == "他说你好。"
+    assert view["voice_profiles"][0]["sample_url"] == (
+        "/api/voice-profiles/voice_a/sample"
+    )
+    assert client.get(view["voice_profiles"][0]["sample_url"]).status_code == 200
 
     alias_view = client.get(
         "/api/projects/fixture_project/views/voice-assignment"
@@ -536,3 +679,57 @@ def test_panel_views_return_context_characters_and_scripts(tmp_path: Path) -> No
     scripts = client.get("/api/projects/fixture_project/views/scripts").json()
     assert scripts["script_source"] == "single_chunk"
     assert scripts["segments"][0]["validation_status"] == "passed"
+    assert scripts["speaker_options"] == ["narrator", "unknown_speaker", "安德鲁"]
+
+    characters = client.post(
+        "/api/projects/fixture_project/characters",
+        json={"name": "法官"},
+    ).json()
+    assert [character["canonical_name"] for character in characters["characters"]] == [
+        "安德鲁",
+        "法官",
+    ]
+
+    scripts = client.post(
+        "/api/projects/fixture_project/script-speaker-edits",
+        json={
+            "edits": [
+                {
+                    "segment_id": "seg_000001",
+                    "speaker": "法官",
+                    "chunk_id": "chunk_0001",
+                }
+            ]
+        },
+    ).json()
+    assert scripts["segments"][0]["speaker"] == "法官"
+
+    characters = client.post(
+        "/api/projects/fixture_project/characters/merge",
+        json={
+            "source_character_id": "character_002",
+            "target_character_id": "character_001",
+        },
+    ).json()
+    assert [character["canonical_name"] for character in characters["characters"]] == [
+        "安德鲁",
+    ]
+    scripts = client.get("/api/projects/fixture_project/views/scripts").json()
+    assert scripts["segments"][0]["speaker"] == "安德鲁"
+
+    characters = client.post(
+        "/api/projects/fixture_project/character-edits",
+        json={
+            "additions": ["世界总统"],
+            "renames": {"character_001": "安德鲁·马丁"},
+            "merges": [],
+        },
+    ).json()
+    assert [character["canonical_name"] for character in characters["characters"]] == [
+        "安德鲁·马丁",
+        "世界总统",
+    ]
+    scripts = client.get("/api/projects/fixture_project/views/scripts").json()
+    assert scripts["segments"][0]["speaker"] == "安德鲁·马丁"
+    scene = client.get("/api/projects/fixture_project/views/scene_summary").json()
+    assert scene["sections"][0]["active_characters"] == ["安德鲁·马丁"]

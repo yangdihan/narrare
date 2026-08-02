@@ -15,6 +15,11 @@ from core.pipeline.chunk_context_profiler import (
     build_stage1_context_hint,
     run_chunk_context_profiler_workflow,
 )
+from core.pipeline.character_review import (
+    add_character,
+    merge_character,
+    update_script_segment_speaker,
+)
 from core.pipeline.script_assembly import run_script_assembly_workflow
 from core.pipeline.script_conversion import run_script_conversion_workflow
 from core.pipeline.speaker_key_normalization import (
@@ -30,6 +35,7 @@ from llm.prompts.speaker_key_reviewer import build_speaker_key_reviewer_user_pro
 from llm.schemas import LlmCompletion
 from llm.prompts.script_converter import build_script_converter_user_prompt
 from storage.json_store import write_json
+from storage.workspace import Workspace
 
 
 class SequentialLlmService:
@@ -253,9 +259,9 @@ def test_script_conversion_repairs_misaligned_paragraph_with_shrinking_retry(
     assert "Repair one source span" in service.prompts[1]
     assert "乙乙。" in service.prompts[1]
     assert result.artifact.segments == [
-            ScriptSegment(
-                segment_id="seg_000001",
-                source_span=SourceSpan(start=0, end=len("甲甲。\n乙乙。\n丙丙。")),
+        ScriptSegment(
+            segment_id="seg_000001",
+            source_span=SourceSpan(start=0, end=len("甲甲。\n乙乙。\n丙丙。")),
             script={"narrator": "甲甲乙乙丙丙"},
             confidence=0.9,
             review_notes=[
@@ -265,15 +271,11 @@ def test_script_conversion_repairs_misaligned_paragraph_with_shrinking_retry(
         )
     ]
     assert (
-        output_root
-        / "chunk_0001"
-        / "attempt_01_repair_01_raw_response.json"
+        output_root / "chunk_0001" / "attempt_01_repair_01_raw_response.json"
     ).exists()
     assert (output_root / "chunk_0001" / "attempt_01_repair_01_script.json").exists()
     assert (
-        output_root
-        / "chunk_0001"
-        / "attempt_01_repair_01_validation_report.json"
+        output_root / "chunk_0001" / "attempt_01_repair_01_validation_report.json"
     ).exists()
 
 
@@ -344,7 +346,7 @@ def test_chunk_context_profiler_writes_context_and_registry(
                             "likely_character_id": "character_001",
                             "confidence": 0.9,
                             "review_notes": [],
-                        }
+                        },
                     ],
                     "current_emotional_state": {
                         "character_001": "calm",
@@ -767,7 +769,6 @@ def test_speaker_key_review_candidate_extraction_skips_canonical_and_narrator() 
     assert [candidate.segment.segment_id for candidate in candidates] == [
         "seg_000003",
         "seg_000004",
-        "seg_000005",
     ]
 
 
@@ -818,12 +819,15 @@ def test_speaker_key_review_applies_high_confidence_key_only_change(
 def test_speaker_key_review_emits_progress_events(
     tmp_path: Path,
 ) -> None:
-    workspace_root, response_dir = write_stage3_review_fixture(tmp_path)
+    workspace_root, response_dir = write_stage3_review_fixture(
+        tmp_path,
+        speaker_key="安德鲁",
+    )
     (response_dir / "seg_000002_response.json").write_text(
         json.dumps(
             {
                 "segment_id": "seg_000002",
-                "current_key": "马丁先生",
+                "current_key": "安德鲁",
                 "decision": "keep",
                 "replacement_key": None,
                 "confidence": 0.7,
@@ -850,12 +854,12 @@ def test_speaker_key_review_emits_progress_events(
         "complete",
     ]
     assert progress_events[1].segment_id == "seg_000002"
-    assert progress_events[1].current_key == "马丁先生"
+    assert progress_events[1].current_key == "安德鲁"
     assert progress_events[2].processed_candidates == 1
     assert progress_events[-1].total_candidates == 1
 
 
-def test_speaker_key_review_reports_low_confidence_without_change(
+def test_speaker_key_review_folds_known_alias_even_when_llm_confidence_is_low(
     tmp_path: Path,
 ) -> None:
     workspace_root, response_dir = write_stage3_review_fixture(
@@ -885,10 +889,48 @@ def test_speaker_key_review_reports_low_confidence_without_change(
     )
     report = json.loads(result.report_path.read_text(encoding="utf-8"))
 
-    assert result.changed_count == 0
-    assert result.artifact.segments[1].script == {"安德鲁": "你好"}
-    assert result.artifact.segments[1].raw_script_key is None
+    assert result.changed_count == 1
+    assert result.artifact.segments[1].script == {"安德鲁·马丁": "你好"}
+    assert result.artifact.segments[1].raw_script_key == "安德鲁"
     assert report["events"][0]["status"] == "low_confidence"
+    assert report["events"][1]["status"] == "deterministic_alias_applied"
+    assert report["final_guard_changed_count"] == 1
+
+
+def test_speaker_key_review_rejects_final_keys_outside_character_registry(
+    tmp_path: Path,
+) -> None:
+    workspace_root, response_dir = write_stage3_review_fixture(
+        tmp_path,
+        speaker_key="陌生人",
+    )
+    (response_dir / "seg_000002_response.json").write_text(
+        json.dumps(
+            {
+                "segment_id": "seg_000002",
+                "current_key": "陌生人",
+                "decision": "keep",
+                "replacement_key": None,
+                "confidence": 0.9,
+                "evidence": ["No known match."],
+                "review_notes": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        run_speaker_key_review_workflow(
+            "fixture_project",
+            response_dir=response_dir,
+            workspace_root=workspace_root,
+        )
+    except RuntimeError as exc:
+        assert "keys outside characters.json" in str(exc)
+        assert "seg_000002: 陌生人" in str(exc)
+    else:
+        raise AssertionError("Stage 3 should reject final unknown speaker keys")
 
 
 def test_stage1_context_hint_keeps_contextual_references_local(
@@ -1024,3 +1066,113 @@ def test_speaker_key_reviewer_prompt_includes_context_without_rewrite_request() 
     assert "马丁先生在本场景中指安德鲁" in prompt
     assert "安德鲁·马丁" in prompt
     assert "Never rewrite the script object value." in prompt
+    assert (
+        "If current_key exactly matches stable_aliases for exactly one character"
+        in prompt
+    )
+    assert (
+        "A non-canonical alias is not an acceptable final key merely because it "
+        "correctly identifies the speaker." in prompt
+    )
+    assert (
+        'the decision must be "replace" and replacement_key must be that '
+        "character's canonical_name." in prompt
+    )
+
+
+def test_character_review_add_merge_and_script_reassignment_update_artifacts(
+    tmp_path: Path,
+) -> None:
+    workspace = Workspace("fixture_project", root=tmp_path / "interim")
+    workspace.ensure()
+    chunk_path = workspace.chunk_text_path(0)
+    chunk_path.write_text("丽星说话安德鲁回答", encoding="utf-8")
+    write_json(
+        workspace.character_registry_path,
+        CharacterRegistryArtifact(
+            project_id="fixture_project",
+            characters=[
+                CharacterRecord(
+                    character_id="character_001",
+                    canonical_name="奇丽星",
+                    stable_aliases=["奇丽星"],
+                    persona_summary="机器人。",
+                    confidence=0.8,
+                ),
+                CharacterRecord(
+                    character_id="character_002",
+                    canonical_name="丽星",
+                    stable_aliases=["丽星"],
+                    speaking_style="直接。",
+                    confidence=0.9,
+                ),
+            ],
+        ),
+    )
+    write_json(
+        workspace.script_artifact_path("complete"),
+        ScriptArtifact(
+            project_id="fixture_project",
+            chunk_id="complete",
+            chunk_source_path=str(chunk_path),
+            chunk_sha256="unused",
+            llm_provider="test",
+            llm_model="test",
+            response_source="assembled",
+            processed_chunk_count=1,
+            segments=[
+                ScriptSegment(
+                    segment_id="seg_000001",
+                    source_span=SourceSpan(start=0, end=4),
+                    script={"丽星": "丽星说话"},
+                    confidence=0.8,
+                ),
+                ScriptSegment(
+                    segment_id="seg_000002",
+                    source_span=SourceSpan(start=4, end=9),
+                    script={"奇丽星": "安德鲁回答"},
+                    confidence=0.8,
+                ),
+            ],
+        ),
+    )
+
+    registry = add_character(
+        "fixture_project",
+        "法官",
+        workspace_root=workspace.root,
+    )
+    assert [character.canonical_name for character in registry.characters] == [
+        "奇丽星",
+        "丽星",
+        "法官",
+    ]
+
+    registry = merge_character(
+        "fixture_project",
+        "character_002",
+        "character_001",
+        workspace_root=workspace.root,
+    )
+    assert [character.canonical_name for character in registry.characters] == [
+        "奇丽星",
+        "法官",
+    ]
+    assert "丽星" in registry.characters[0].stable_aliases
+
+    script = ScriptArtifact.model_validate_json(
+        workspace.script_artifact_path("complete").read_text(encoding="utf-8")
+    )
+    assert [segment.speaker for segment in script.segments] == ["奇丽星", "奇丽星"]
+
+    update_script_segment_speaker(
+        "fixture_project",
+        "seg_000002",
+        "法官",
+        chunk_id="complete",
+        workspace_root=workspace.root,
+    )
+    script = ScriptArtifact.model_validate_json(
+        workspace.script_artifact_path("complete").read_text(encoding="utf-8")
+    )
+    assert [segment.speaker for segment in script.segments] == ["奇丽星", "法官"]

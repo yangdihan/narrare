@@ -19,6 +19,15 @@ from core.pipeline.chunk_context_profiler import (
     run_chunk_context_profiler_workflow,
 )
 from core.pipeline.chunking import run_chunking_workflow
+from core.pipeline.character_review import (
+    add_character,
+    apply_character_edits,
+    apply_script_speaker_edits,
+    merge_character,
+    rename_character,
+    speaker_options,
+    update_script_segment_speaker,
+)
 from core.pipeline.script_assembly import (
     COMPLETE_SCRIPT_CHUNK_ID,
     run_script_assembly_workflow,
@@ -27,7 +36,12 @@ from core.pipeline.script_conversion import (
     ScriptProgress,
     run_script_conversion_workflow,
 )
+from core.pipeline.speaker_key_review import (
+    SpeakerKeyReviewProgress,
+    run_speaker_key_review_workflow,
+)
 from core.pipeline.qwen_tts import qwen_delete_readiness_report
+from core.pipeline.voice_assets import load_voice_inventory
 from core.pipeline.voice_assignment import (
     AudioGenerationProgress,
     build_voice_assignment_view,
@@ -78,6 +92,11 @@ class Stage2JobRequest(BaseModel):
     max_retries: int = 1
 
 
+class Stage3JobRequest(BaseModel):
+    project_id: str
+    response_dir: str | None = None
+
+
 class VoiceSampleRequest(BaseModel):
     speaker: str
     voice_profile_id: str
@@ -90,6 +109,36 @@ class VoiceAssignmentRequest(BaseModel):
 class AudioGenerationJobRequest(BaseModel):
     assignments: dict[str, str]
     only_missing: bool = True
+
+
+class CharacterAddRequest(BaseModel):
+    name: str
+
+
+class CharacterMergeRequest(BaseModel):
+    source_character_id: str
+    target_character_id: str
+
+
+class CharacterRenameRequest(BaseModel):
+    character_id: str
+    name: str
+
+
+class CharacterEditSaveRequest(BaseModel):
+    additions: list[str] = []
+    renames: dict[str, str] = {}
+    merges: list[CharacterMergeRequest] = []
+
+
+class ScriptSpeakerUpdateRequest(BaseModel):
+    segment_id: str
+    speaker: str
+    chunk_id: str | None = None
+
+
+class ScriptSpeakerEditSaveRequest(BaseModel):
+    edits: list[ScriptSpeakerUpdateRequest] = []
 
 
 @dataclass
@@ -345,6 +394,33 @@ def create_app(
         thread.start()
         return job.to_dict()
 
+    @app.post("/api/stage3/jobs")
+    def start_stage3_job(
+        request: Request,
+        payload: Stage3JobRequest,
+    ) -> dict[str, Any]:
+        workspace = _workspace(request, payload.project_id)
+        missing_inputs = _stage3_missing_inputs(workspace)
+        if missing_inputs:
+            raise HTTPException(
+                status_code=409,
+                detail="Stage 3 requires " + ", ".join(missing_inputs),
+            )
+
+        response_dir = None
+        if payload.response_dir:
+            response_dir = _resolve_existing_dir(payload.response_dir)
+
+        registry: JobRegistry = request.app.state.jobs
+        job = registry.create(payload.project_id, "stage3", "complete")
+        thread = threading.Thread(
+            target=_run_stage3_job,
+            args=(request.app, job.job_id, payload, response_dir),
+            daemon=True,
+        )
+        thread.start()
+        return job.to_dict()
+
     @app.get("/api/jobs/{job_id}")
     def get_job(request: Request, job_id: str) -> dict[str, Any]:
         registry: JobRegistry = request.app.state.jobs
@@ -375,6 +451,114 @@ def create_app(
             "project_id": project_id,
             **get_script_payload(workspace, chunk_id),
         }
+
+    @app.post("/api/projects/{project_id}/characters")
+    def add_character_endpoint(
+        request: Request,
+        project_id: str,
+        payload: CharacterAddRequest,
+    ) -> dict[str, Any]:
+        try:
+            add_character(
+                project_id,
+                payload.name,
+                workspace_root=_state_path(request, "workspace_root"),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _character_summary_view(_workspace(request, project_id))
+
+    @app.post("/api/projects/{project_id}/characters/merge")
+    def merge_character_endpoint(
+        request: Request,
+        project_id: str,
+        payload: CharacterMergeRequest,
+    ) -> dict[str, Any]:
+        try:
+            merge_character(
+                project_id,
+                payload.source_character_id,
+                payload.target_character_id,
+                workspace_root=_state_path(request, "workspace_root"),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _character_summary_view(_workspace(request, project_id))
+
+    @app.patch("/api/projects/{project_id}/characters/rename")
+    def rename_character_endpoint(
+        request: Request,
+        project_id: str,
+        payload: CharacterRenameRequest,
+    ) -> dict[str, Any]:
+        try:
+            rename_character(
+                project_id,
+                payload.character_id,
+                payload.name,
+                workspace_root=_state_path(request, "workspace_root"),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _character_summary_view(_workspace(request, project_id))
+
+    @app.post("/api/projects/{project_id}/character-edits")
+    def save_character_edits_endpoint(
+        request: Request,
+        project_id: str,
+        payload: CharacterEditSaveRequest,
+    ) -> dict[str, Any]:
+        try:
+            apply_character_edits(
+                project_id,
+                additions=payload.additions,
+                renames=payload.renames,
+                merges=[
+                    (merge.source_character_id, merge.target_character_id)
+                    for merge in payload.merges
+                ],
+                workspace_root=_state_path(request, "workspace_root"),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _character_summary_view(_workspace(request, project_id))
+
+    @app.patch("/api/projects/{project_id}/script-speakers")
+    def update_script_speaker_endpoint(
+        request: Request,
+        project_id: str,
+        payload: ScriptSpeakerUpdateRequest,
+    ) -> dict[str, Any]:
+        try:
+            update_script_segment_speaker(
+                project_id,
+                payload.segment_id,
+                payload.speaker,
+                chunk_id=payload.chunk_id,
+                workspace_root=_state_path(request, "workspace_root"),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _scripts_view(_workspace(request, project_id), payload.chunk_id)
+
+    @app.post("/api/projects/{project_id}/script-speaker-edits")
+    def save_script_speaker_edits_endpoint(
+        request: Request,
+        project_id: str,
+        payload: ScriptSpeakerEditSaveRequest,
+    ) -> dict[str, Any]:
+        try:
+            apply_script_speaker_edits(
+                project_id,
+                [
+                    (edit.segment_id, edit.speaker, edit.chunk_id)
+                    for edit in payload.edits
+                ],
+                workspace_root=_state_path(request, "workspace_root"),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _scripts_view(_workspace(request, project_id), None)
 
     @app.post("/api/projects/{project_id}/voice-samples")
     def generate_voice_sample_endpoint(
@@ -461,6 +645,22 @@ def create_app(
         if not target.exists() or target.suffix.lower() != ".wav":
             raise HTTPException(status_code=404, detail="audio file not found")
         return FileResponse(target, media_type="audio/wav")
+
+    @app.get("/api/voice-profiles/{profile_id}/sample")
+    def get_voice_profile_sample(request: Request, profile_id: str) -> FileResponse:
+        inventory_path = _state_path(request, "voice_inventory_path")
+        inventory = load_voice_inventory(inventory_path)
+        profile = next(
+            (item for item in inventory.profiles if item.profile_id == profile_id),
+            None,
+        )
+        if profile is None or not profile.sample_path:
+            raise HTTPException(status_code=404, detail="voice sample not found")
+        target = _resolve_voice_inventory_asset(inventory_path, profile.sample_path)
+        if target.suffix.lower() not in {".wav", ".m4a"}:
+            raise HTTPException(status_code=404, detail="voice sample not found")
+        media_type = "audio/wav" if target.suffix.lower() == ".wav" else "audio/mp4"
+        return FileResponse(target, media_type=media_type)
 
     return app
 
@@ -602,9 +802,12 @@ def _run_stage2_job(
             except Exception as exc:
                 assembly_errors = [f"script assembly failed: {exc}"]
             else:
+
                 def assembly_complete(job: PipelineJob) -> None:
                     job.artifact_paths["script"] = str(
-                        assembly.workspace.script_artifact_path(COMPLETE_SCRIPT_CHUNK_ID)
+                        assembly.workspace.script_artifact_path(
+                            COMPLETE_SCRIPT_CHUNK_ID
+                        )
                     )
                     job.artifact_paths["validation_report"] = str(
                         assembly.validation_report_path
@@ -651,6 +854,64 @@ def _run_stage2_job(
         registry.update(job_id, fail)
 
 
+def _run_stage3_job(
+    app: FastAPI,
+    job_id: str,
+    payload: Stage3JobRequest,
+    response_dir: Path | None,
+) -> None:
+    registry: JobRegistry = app.state.jobs
+    workspace_root: Path = app.state.workspace_root
+
+    def on_progress(progress: SpeakerKeyReviewProgress) -> None:
+        def update(job: PipelineJob) -> None:
+            job.status = progress.status
+            job.total_chunks = progress.total_candidates
+            job.completed_chunks = progress.processed_candidates
+            job.current_chunk_id = progress.segment_id
+            job.current_speaker = progress.current_key
+            job.errors = progress.errors
+
+        registry.update(job_id, update)
+
+    try:
+        result = run_speaker_key_review_workflow(
+            payload.project_id,
+            response_dir=response_dir,
+            workspace_root=workspace_root,
+            progress_callback=on_progress,
+        )
+
+        def complete(job: PipelineJob) -> None:
+            job.status = "complete"
+            job.total_chunks = result.reviewed_count
+            job.completed_chunks = result.reviewed_count
+            job.current_chunk_id = None
+            job.current_speaker = None
+            job.errors = result.errors
+            job.artifact_paths = {
+                "script": str(
+                    result.workspace.key_reviewed_script_artifact_path(
+                        COMPLETE_SCRIPT_CHUNK_ID
+                    )
+                ),
+                "review_report": str(result.report_path),
+            }
+
+        registry.update(job_id, complete)
+    except Exception as exc:
+        error_message = str(exc)
+
+        def fail(job: PipelineJob) -> None:
+            job.status = "failed"
+            if not job.errors:
+                job.errors = [error_message]
+            job.current_chunk_id = None
+            job.current_speaker = None
+
+        registry.update(job_id, fail)
+
+
 def _run_audio_generation_job(
     app: FastAPI,
     job_id: str,
@@ -673,11 +934,11 @@ def _run_audio_generation_job(
 
     try:
         result = run_audio_generation_workflow(
-                project_id,
-                workspace_root=workspace_root,
-                voice_inventory_path=app.state.voice_inventory_path,
-                only_missing=only_missing,
-                adapter=_app_tts_adapter(app),
+            project_id,
+            workspace_root=workspace_root,
+            voice_inventory_path=app.state.voice_inventory_path,
+            only_missing=only_missing,
+            adapter=_app_tts_adapter(app),
             progress_callback=on_progress,
         )
 
@@ -712,7 +973,11 @@ def _chunks_response(workspace: Workspace) -> dict[str, Any]:
     chunks = []
     for chunk in artifact.get("chunks", []):
         text_path = workspace.chunk_text_path(int(chunk["index"]))
-        text = text_path.read_text(encoding="utf-8") if text_path.exists() else chunk["text"]
+        text = (
+            text_path.read_text(encoding="utf-8")
+            if text_path.exists()
+            else chunk["text"]
+        )
         chunks.append(
             {
                 **chunk,
@@ -831,6 +1096,7 @@ def _scripts_view(
             "scripts",
             "No script artifacts exist for this project.",
         )
+    stage3_missing_inputs = _stage3_missing_inputs(workspace)
 
     return {
         "project_id": workspace.project_id,
@@ -838,8 +1104,27 @@ def _scripts_view(
         "available": True,
         "requested_chunk_id": chunk_id,
         "script_options": _script_options(workspace),
+        "speaker_options": _speaker_options_payload(workspace),
+        "stage3_enabled": not stage3_missing_inputs,
+        "stage3_missing_inputs": stage3_missing_inputs,
         **continuous_payload,
     }
+
+
+def _stage3_missing_inputs(workspace: Workspace) -> list[str]:
+    missing = []
+    if not workspace.script_artifact_path(COMPLETE_SCRIPT_CHUNK_ID).exists():
+        missing.append("an assembled complete script")
+    if not workspace.character_registry_path.exists():
+        missing.append("the Stage 1 character registry")
+    if not workspace.chunks_path.exists():
+        missing.append("the chunks manifest")
+    elif not all(
+        workspace.context_artifact_path(str(chunk["chunk_id"])).exists()
+        for chunk in _read_json(workspace.chunks_path).get("chunks", [])
+    ):
+        missing.append("Stage 1 context for every chunk")
+    return missing
 
 
 def _voice_assignment_view(request: Request, workspace: Workspace) -> dict[str, Any]:
@@ -860,7 +1145,7 @@ def _voice_assignment_view(request: Request, workspace: Workspace) -> dict[str, 
         "tts_generation_status": _tts_generation_status(request),
         "script_artifact_path": str(view.script_artifact_path),
         "voice_inventory_path": str(view.inventory_path),
-        "voice_profiles": view.voice_profiles,
+        "voice_profiles": _voice_profile_payloads(request, view.voice_profiles),
         "missing_voice_profile_ids": view.missing_voice_profile_ids,
         "assignments": _assignment_payloads(view.assignments, workspace=workspace),
     }
@@ -1026,6 +1311,13 @@ def _script_options(workspace: Workspace) -> list[dict[str, Any]]:
     return options
 
 
+def _speaker_options_payload(workspace: Workspace) -> list[str]:
+    try:
+        return speaker_options(workspace.project_id, workspace_root=workspace.root)
+    except RuntimeError:
+        return ["narrator", "unknown_speaker"]
+
+
 def _select_script_chunk_id(
     script_options: list[dict[str, Any]],
     chunk_id: str | None,
@@ -1143,10 +1435,54 @@ def _audio_url(workspace: Workspace, path: str | None) -> str | None:
         relative = target.resolve().relative_to(audio_root)
     except ValueError:
         return None
-    return (
-        f"/api/projects/{workspace.project_id}/audio-file/"
-        f"{relative.as_posix()}"
-    )
+    return f"/api/projects/{workspace.project_id}/audio-file/{relative.as_posix()}"
+
+
+def _voice_profile_payloads(
+    request: Request,
+    profiles: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    payloads = []
+    inventory_path = _state_path(request, "voice_inventory_path")
+    for profile in profiles:
+        payload = dict(profile)
+        if _voice_profile_sample_exists(inventory_path, profile.get("sample_path")):
+            payload["sample_url"] = (
+                f"/api/voice-profiles/{profile['profile_id']}/sample"
+            )
+        else:
+            payload["sample_url"] = None
+        payloads.append(payload)
+    return payloads
+
+
+def _voice_profile_sample_exists(
+    inventory_path: Path,
+    sample_path: object,
+) -> bool:
+    if not isinstance(sample_path, str) or not sample_path:
+        return False
+    try:
+        target = _resolve_voice_inventory_asset(inventory_path, sample_path)
+    except HTTPException:
+        return False
+    return target.exists() and target.suffix.lower() in {".wav", ".m4a"}
+
+
+def _resolve_voice_inventory_asset(inventory_path: Path, asset_path: str) -> Path:
+    inventory_root = inventory_path.parent.resolve()
+    target = Path(asset_path)
+    if not target.is_absolute():
+        cwd_target = (Path.cwd() / target).resolve()
+        inventory_target = (inventory_root / target).resolve()
+        target = cwd_target if cwd_target.exists() else inventory_target
+    else:
+        target = target.resolve()
+    if inventory_root not in target.parents and target != inventory_root:
+        raise HTTPException(status_code=400, detail="voice asset escapes inventory")
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="voice sample not found")
+    return target
 
 
 def _ensure_tts_generation_enabled(request: Request) -> None:
@@ -1258,7 +1594,9 @@ def _resolve_source_path(request: Request, source_path: str) -> Path:
     else:
         candidate = candidate.resolve()
     if raw_root not in candidate.parents and candidate != raw_root:
-        raise HTTPException(status_code=400, detail="source path must be under data/raw")
+        raise HTTPException(
+            status_code=400, detail="source path must be under data/raw"
+        )
     if candidate.suffix != ".txt" or not candidate.exists():
         raise HTTPException(status_code=404, detail="source text file not found")
     return candidate

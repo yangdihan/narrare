@@ -21,6 +21,12 @@ const state = {
     right: "scripts",
   },
   voiceAssignments: {},
+  characterEdits: {
+    additions: [],
+    renames: {},
+    merges: [],
+  },
+  scriptSpeakerEdits: {},
 };
 
 const el = (id) => document.getElementById(id);
@@ -84,6 +90,8 @@ async function loadSource(path) {
   state.sourcePath = data.path;
   state.projectId = el("project-id").value.trim() || state.projectId || DEFAULT_PROJECT_ID;
   state.chunkSelection = "all";
+  clearCharacterEdits();
+  clearScriptSpeakerEdits();
   el("project-id").value = state.projectId;
   setStatus("global-status", `${data.character_count} source characters loaded`);
   await refreshPanels();
@@ -134,6 +142,19 @@ async function startStage2(ownerPanel, selection) {
   startPolling(job, ownerPanel);
 }
 
+async function startStage3(ownerPanel) {
+  state.projectId = el("project-id").value.trim();
+  if (!state.projectId) return;
+  setPanelJobStatus(ownerPanel, "starting Stage 3 character unification...", 0, 1, false);
+  const job = await api("/api/stage3/jobs", {
+    method: "POST",
+    body: JSON.stringify({
+      project_id: state.projectId,
+    }),
+  });
+  startPolling(job, ownerPanel);
+}
+
 function startPolling(job, ownerPanel) {
   if (state.pollTimer) clearInterval(state.pollTimer);
   state.currentJobId = job.job_id;
@@ -160,7 +181,8 @@ function renderJobStatus(job) {
   const currentId = job.current_segment_id || job.current_chunk_id;
   const current = currentId ? ` · ${currentId}` : "";
   const speaker = job.current_speaker ? ` · ${job.current_speaker}` : "";
-  const message = `${job.phase} ${job.status}${current}${speaker} · ${completed}/${total || "?"}`;
+  const errors = job.errors?.length ? ` · ${job.errors.join("; ")}` : "";
+  const message = `${job.phase} ${job.status}${current}${speaker} · ${completed}/${total || "?"}${errors}`;
   setStatus("global-status", message, job.status === "failed");
   setPanelJobStatus(state.currentJobOwner, message, completed, total || 1, job.status === "failed");
 }
@@ -204,7 +226,7 @@ function renderView(payload, panel) {
   if (payload.view_type === "chunks") return renderChunks(payload, panel);
   if (payload.view_type === "scene_summary") return renderSceneSummary(payload);
   if (payload.view_type === "character_summary") return renderCharacters(payload);
-  if (payload.view_type === "scripts") return renderScripts(payload);
+  if (payload.view_type === "scripts") return renderScripts(payload, panel);
   if (payload.view_type === "voice_assignment") return renderVoiceAssignment(payload, panel);
   return emptyState("Unsupported view type.");
 }
@@ -344,12 +366,29 @@ function renderSceneSummary(payload) {
 
 function renderCharacters(payload) {
   const fragment = document.createDocumentFragment();
-  fragment.appendChild(metaBar(`${payload.characters.length} character records`));
-  for (const character of payload.characters) {
+  const characters = stagedCharacters(payload.characters);
+  fragment.appendChild(characterEditToolbar(payload));
+  fragment.appendChild(metaBar(`${characters.length} character records`));
+  for (const character of characters) {
     const card = cardNode("character-card");
+    const header = document.createElement("div");
+    header.className = "card-header";
     const title = document.createElement("h3");
     title.textContent = `${character.character_id} · ${character.canonical_name}`;
-    card.appendChild(title);
+    const actions = document.createElement("div");
+    actions.className = "card-actions";
+    const renameButton = document.createElement("button");
+    renameButton.type = "button";
+    renameButton.textContent = "Rename";
+    renameButton.addEventListener("click", () => stageCharacterRename(character));
+    const mergeButton = document.createElement("button");
+    mergeButton.type = "button";
+    mergeButton.textContent = "Merge with";
+    mergeButton.disabled = character.unsaved || characters.length < 2;
+    mergeButton.addEventListener("click", () => openMergeDialog(characters, character));
+    actions.append(renameButton, mergeButton);
+    header.append(title, actions);
+    card.appendChild(header);
     card.appendChild(fieldLine("Stable aliases", (character.stable_aliases || []).join(", ") || "none"));
     card.appendChild(fieldLine("Persona", character.persona_summary || "none"));
     card.appendChild(fieldLine("Speaking style", character.speaking_style || "none"));
@@ -360,17 +399,181 @@ function renderCharacters(payload) {
   return fragment;
 }
 
-function renderScripts(payload) {
+function characterEditToolbar(payload) {
+  const toolbar = document.createElement("div");
+  toolbar.className = "edit-toolbar";
+  const addButton = document.createElement("button");
+  addButton.type = "button";
+  addButton.textContent = "Add character";
+  addButton.addEventListener("click", () => stageCharacterAddition());
+  const saveButton = document.createElement("button");
+  saveButton.type = "button";
+  saveButton.className = "primary";
+  saveButton.textContent = "save edit";
+  saveButton.disabled = !hasCharacterEdits();
+  const status = document.createElement("span");
+  status.className = "status edit-status";
+  status.textContent = hasCharacterEdits() ? "unsaved edits" : "";
+  saveButton.addEventListener("click", async () => {
+    saveButton.disabled = true;
+    status.classList.remove("error");
+    status.textContent = "saving...";
+    try {
+      await api(`/api/projects/${encodeURIComponent(payload.project_id)}/character-edits`, {
+        method: "POST",
+        body: JSON.stringify(state.characterEdits),
+      });
+      clearCharacterEdits();
+      status.textContent = "saved";
+      await refreshPanels();
+    } catch (error) {
+      saveButton.disabled = false;
+      status.textContent = error.message;
+      status.classList.add("error");
+    }
+  });
+  toolbar.append(addButton, saveButton, status);
+  return toolbar;
+}
+
+function stagedCharacters(characters) {
+  const mergeSources = new Set(
+    state.characterEdits.merges.map((merge) => merge.source_character_id)
+  );
+  const output = characters
+    .filter((character) => !mergeSources.has(character.character_id))
+    .map((character) => ({
+      ...character,
+      canonical_name: state.characterEdits.renames[character.character_id] || character.canonical_name,
+    }));
+  state.characterEdits.additions.forEach((name, index) => {
+    output.push({
+      character_id: `unsaved_${index + 1}`,
+      canonical_name: name,
+      stable_aliases: [name],
+      contextual_references: [],
+      aliases: [],
+      alias_evidence: [],
+      persona_summary: "Unsaved character.",
+      speaking_style: null,
+      age_impression: null,
+      voice_variant_notes: [],
+      confidence: 1,
+      review_notes: ["Pending save."],
+      unsaved: true,
+    });
+  });
+  return output;
+}
+
+function stageCharacterAddition() {
+  const name = window.prompt("Character name");
+  if (!name || !name.trim()) return;
+  state.characterEdits.additions.push(name.trim());
+  refreshPanels();
+}
+
+function stageCharacterRename(character) {
+  if (character.unsaved) {
+    const index = Number(character.character_id.replace("unsaved_", "")) - 1;
+    const name = window.prompt("Character name", character.canonical_name);
+    if (!name || !name.trim()) return;
+    state.characterEdits.additions[index] = name.trim();
+    refreshPanels();
+    return;
+  }
+  const name = window.prompt("Character name", character.canonical_name);
+  if (!name || !name.trim() || name.trim() === character.canonical_name) return;
+  state.characterEdits.renames[character.character_id] = name.trim();
+  refreshPanels();
+}
+
+function openMergeDialog(characters, sourceCharacter) {
+  const targets = characters.filter(
+    (character) => (
+      character.character_id !== sourceCharacter.character_id && !character.unsaved
+    )
+  );
+  if (targets.length === 0) return;
+
+  const dialog = document.createElement("dialog");
+  dialog.className = "modal-dialog";
+  const title = document.createElement("h3");
+  title.textContent = `Merge ${sourceCharacter.canonical_name} with`;
+  const select = document.createElement("select");
+  select.className = "wide-select";
+  for (const target of targets) {
+    const option = document.createElement("option");
+    option.value = target.character_id;
+    option.textContent = `${target.canonical_name} (${target.character_id})`;
+    select.appendChild(option);
+  }
+  const actions = document.createElement("div");
+  actions.className = "dialog-actions";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => dialog.close());
+  const confirm = document.createElement("button");
+  confirm.type = "button";
+  confirm.className = "primary";
+  confirm.textContent = "Confirm merge";
+  confirm.addEventListener("click", () => {
+    state.characterEdits.merges = state.characterEdits.merges.filter(
+      (merge) => merge.source_character_id !== sourceCharacter.character_id
+    );
+    state.characterEdits.merges.push({
+      source_character_id: sourceCharacter.character_id,
+      target_character_id: select.value,
+    });
+    dialog.close();
+    refreshPanels();
+  });
+  actions.append(cancel, confirm);
+  dialog.append(title, select, actions);
+  dialog.addEventListener("close", () => dialog.remove());
+  document.body.appendChild(dialog);
+  dialog.showModal();
+}
+
+function hasCharacterEdits() {
+  return (
+    state.characterEdits.additions.length > 0 ||
+    Object.keys(state.characterEdits.renames).length > 0 ||
+    state.characterEdits.merges.length > 0
+  );
+}
+
+function clearCharacterEdits() {
+  state.characterEdits = {
+    additions: [],
+    renames: {},
+    merges: [],
+  };
+}
+
+function renderScripts(payload, panel) {
   const fragment = document.createDocumentFragment();
   const report = payload.validation_report;
   const status = report?.exact_reconstruction_success ? "validation passed" : "validation pending/failed";
+  fragment.appendChild(scriptEditToolbar(payload, panel));
   fragment.appendChild(metaBar(`${payload.script_source} · ${payload.segments.length} segments · ${status}`));
   for (const segment of payload.segments) {
+    const chunkId = segment.chunk_id || payload.selected_chunk_id || payload.chunk_id;
+    const editKey = scriptSpeakerEditKey(segment.segment_id, chunkId);
+    const currentSpeaker = state.scriptSpeakerEdits[editKey]?.speaker || segment.speaker;
     const block = cardNode(`segment ${segment.validation_status}`);
     const speaker = document.createElement("div");
-    speaker.className = "speaker";
+    speaker.className = "speaker speaker-row";
     const chunkLabel = segment.chunk_id ? `${segment.chunk_id} · ` : "";
-    speaker.textContent = `${chunkLabel}${segment.segment_id} · ${segment.speaker}`;
+    const label = document.createElement("span");
+    label.className = "speaker-label";
+    label.textContent = `${chunkLabel}${segment.segment_id}`;
+    const select = speakerSelect(payload.speaker_options || [], currentSpeaker);
+    select.addEventListener("change", () => {
+      stageScriptSpeakerEdit(segment.segment_id, select.value, chunkId, editKey);
+    });
+    speaker.append(label, select);
     const text = document.createElement("pre");
     text.textContent = segment.text;
     block.append(speaker, text);
@@ -383,6 +586,96 @@ function renderScripts(payload) {
     fragment.appendChild(block);
   }
   return fragment;
+}
+
+function scriptEditToolbar(payload, panel) {
+  const toolbar = document.createElement("div");
+  toolbar.className = "edit-toolbar";
+  const saveButton = document.createElement("button");
+  saveButton.type = "button";
+  saveButton.className = "primary";
+  saveButton.textContent = "save edit";
+  saveButton.disabled = !hasScriptSpeakerEdits();
+  const status = document.createElement("span");
+  status.className = "status edit-status";
+  status.textContent = hasScriptSpeakerEdits() ? "unsaved edits" : "";
+  saveButton.addEventListener("click", async () => {
+    saveButton.disabled = true;
+    status.classList.remove("error");
+    status.textContent = "saving...";
+    try {
+      await api(`/api/projects/${encodeURIComponent(payload.project_id)}/script-speaker-edits`, {
+        method: "POST",
+        body: JSON.stringify({
+          edits: Object.values(state.scriptSpeakerEdits),
+        }),
+      });
+      clearScriptSpeakerEdits();
+      status.textContent = "saved";
+      await refreshPanels();
+    } catch (error) {
+      saveButton.disabled = false;
+      status.textContent = error.message;
+      status.classList.add("error");
+    }
+  });
+  const unifyButton = document.createElement("button");
+  unifyButton.type = "button";
+  unifyButton.className = "primary";
+  unifyButton.textContent = "auto unify characters";
+  unifyButton.disabled = !payload.stage3_enabled || hasScriptSpeakerEdits();
+  if (!payload.stage3_enabled) {
+    unifyButton.title = `Stage 3 requires ${payload.stage3_missing_inputs.join(", ")}`;
+  } else if (hasScriptSpeakerEdits()) {
+    unifyButton.title = "Save or discard pending speaker edits first";
+  }
+  unifyButton.addEventListener("click", () => {
+    unifyButton.disabled = true;
+    startStage3(panel).catch((error) => {
+      unifyButton.disabled = false;
+      setPanelJobStatus(panel, error.message, 0, 1, true);
+    });
+  });
+  toolbar.append(unifyButton, saveButton, status);
+  return toolbar;
+}
+
+function speakerSelect(options, currentSpeaker) {
+  const select = document.createElement("select");
+  select.className = "speaker-select";
+  const seen = new Set();
+  for (const value of [currentSpeaker, ...options]) {
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    select.appendChild(option);
+  }
+  select.value = currentSpeaker;
+  return select;
+}
+
+function stageScriptSpeakerEdit(segmentId, speaker, chunkId, editKey) {
+  state.scriptSpeakerEdits[editKey] = {
+    segment_id: segmentId,
+    speaker,
+    chunk_id: chunkId,
+  };
+  setStatus("global-status", `${segmentId} speaker staged as ${speaker}`);
+  refreshPanels();
+}
+
+function scriptSpeakerEditKey(segmentId, chunkId) {
+  return `${chunkId || "complete"}:${segmentId}`;
+}
+
+function hasScriptSpeakerEdits() {
+  return Object.keys(state.scriptSpeakerEdits).length > 0;
+}
+
+function clearScriptSpeakerEdits() {
+  state.scriptSpeakerEdits = {};
 }
 
 function renderVoiceAssignment(payload, panel) {
@@ -449,6 +742,7 @@ function voiceAssignmentCard(payload, assignment, panel) {
 
   const controls = document.createElement("div");
   controls.className = "voice-controls";
+
   const label = document.createElement("label");
   label.textContent = "Voice";
   const select = document.createElement("select");
@@ -462,10 +756,23 @@ function voiceAssignmentCard(payload, assignment, panel) {
   select.disabled = !payload.tts_generation_enabled;
   label.appendChild(select);
 
-  const audio = document.createElement("audio");
-  audio.controls = true;
-  audio.preload = "none";
-  if (assignment.sample_url) audio.src = assignment.sample_url;
+  const originalAudio = document.createElement("audio");
+  originalAudio.controls = true;
+  originalAudio.preload = "none";
+  originalAudio.className = "voice-audio";
+  updateOriginalVoiceAudio(originalAudio, payload.voice_profiles, select.value);
+
+  const generatedAudio = document.createElement("audio");
+  generatedAudio.controls = true;
+  generatedAudio.preload = "none";
+  generatedAudio.className = "voice-audio";
+  if (assignment.sample_url) generatedAudio.src = assignment.sample_url;
+
+  const sampleButton = document.createElement("button");
+  sampleButton.className = "sample-button";
+  sampleButton.type = "button";
+  sampleButton.textContent = "generate sample";
+  sampleButton.disabled = !payload.tts_generation_enabled || !select.value;
 
   const rowStatus = document.createElement("span");
   rowStatus.className = "voice-row-status status";
@@ -473,18 +780,34 @@ function voiceAssignmentCard(payload, assignment, panel) {
     rowStatus.textContent = "CLI smoke pending";
   }
 
-  select.addEventListener("change", async (event) => {
-    if (!payload.tts_generation_enabled) return;
+  select.addEventListener("change", (event) => {
     const profileId = event.target.value;
     state.voiceAssignments[assignment.speaker] = profileId;
+    sampleButton.disabled = !payload.tts_generation_enabled || !profileId;
+    updateOriginalVoiceAudio(originalAudio, payload.voice_profiles, profileId);
     if (!profileId) {
       status.textContent = "unassigned";
-      audio.removeAttribute("src");
+      originalAudio.removeAttribute("src");
+      generatedAudio.removeAttribute("src");
       rowStatus.textContent = "";
       return;
     }
+    status.textContent = "assigned";
+    rowStatus.textContent = "";
+  });
+
+  sampleButton.addEventListener("click", async () => {
+    if (!payload.tts_generation_enabled) return;
+    const profileId = select.value;
+    if (!profileId) {
+      rowStatus.textContent = "select a voice first";
+      rowStatus.classList.add("error");
+      return;
+    }
+    rowStatus.classList.remove("error");
     status.textContent = "previewing";
     rowStatus.textContent = "generating preview...";
+    setSampleButtonLoading(sampleButton, true);
     try {
       const result = await api(
         `/api/projects/${encodeURIComponent(payload.project_id)}/voice-samples`,
@@ -496,20 +819,54 @@ function voiceAssignmentCard(payload, assignment, panel) {
           }),
         }
       );
-      audio.src = `${result.sample_url}?t=${Date.now()}`;
-      audio.load();
+      generatedAudio.src = `${result.sample_url}?t=${Date.now()}`;
+      generatedAudio.load();
       status.textContent = "assigned";
       rowStatus.textContent = "preview ready";
     } catch (error) {
       status.textContent = "preview failed";
       rowStatus.textContent = error.message;
       rowStatus.classList.add("error");
+    } finally {
+      setSampleButtonLoading(sampleButton, false);
     }
   });
 
-  controls.append(label, audio, rowStatus);
+  controls.append(
+    label,
+    audioBlock("Original sample", originalAudio),
+    sampleButton,
+    audioBlock("Generated sample", generatedAudio),
+    rowStatus
+  );
   card.append(header, summary, quoteLabel, quote, controls);
   return card;
+}
+
+function updateOriginalVoiceAudio(audio, profiles, profileId) {
+  const profile = profiles.find((item) => item.profile_id === profileId);
+  if (profile?.sample_url) {
+    audio.src = profile.sample_url;
+    audio.load();
+  } else {
+    audio.removeAttribute("src");
+  }
+}
+
+function audioBlock(labelText, audio) {
+  const block = document.createElement("div");
+  block.className = "voice-audio-block";
+  const label = document.createElement("span");
+  label.className = "voice-audio-label";
+  label.textContent = labelText;
+  block.append(label, audio);
+  return block;
+}
+
+function setSampleButtonLoading(button, isLoading) {
+  button.classList.toggle("loading", isLoading);
+  button.disabled = isLoading;
+  button.textContent = isLoading ? "generating..." : "generate sample";
 }
 
 function voiceAssignmentFooter(payload, panel) {
@@ -670,6 +1027,8 @@ document.addEventListener("DOMContentLoaded", () => {
   el("project-id").addEventListener("change", async (event) => {
     state.projectId = event.target.value.trim();
     state.chunkSelection = "all";
+    clearCharacterEdits();
+    clearScriptSpeakerEdits();
     await refreshPanels();
   });
   el("project-id").addEventListener("input", (event) => {

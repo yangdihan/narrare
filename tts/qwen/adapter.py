@@ -29,7 +29,7 @@ class QwenTTSAdapter:
         self.model_path = Path(
             model_path or os.environ.get("NARRARE_QWEN_MODEL", "") or QWEN_DEFAULT_MODEL_PATH
         )
-        self.device = device or os.environ.get("NARRARE_QWEN_DEVICE", "auto")
+        self.device = device or os.environ.get("NARRARE_QWEN_DEVICE", "cpu")
         self._model: Any | None = None
         self._voice_item_cls: Any | None = None
 
@@ -169,8 +169,6 @@ def _resolve_device(device: str) -> str:
     if normalized == "auto":
         if torch.cuda.is_available():
             return "cuda"
-        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            return "mps"
         return "cpu"
     if normalized == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("Qwen device cuda requested, but CUDA is not available")

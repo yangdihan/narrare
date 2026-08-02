@@ -258,6 +258,17 @@ def run_speaker_key_review_workflow(
             )
         )
 
+    final_segments, final_guard_events, final_guard_errors = _enforce_final_speaker_keys(
+        reviewed_segments,
+        registry=registry,
+    )
+    review_events.extend(final_guard_events)
+    changed_count = sum(
+        1
+        for original, reviewed in zip(script_artifact.segments, final_segments)
+        if original.speaker != reviewed.speaker
+    )
+
     reviewed_artifact = ScriptArtifact(
         project_id=script_artifact.project_id,
         chunk_id=script_artifact.chunk_id,
@@ -267,13 +278,13 @@ def run_speaker_key_review_workflow(
         llm_model=script_artifact.llm_model,
         response_source="speaker_key_review",
         processed_chunk_count=script_artifact.processed_chunk_count,
-        segments=reviewed_segments,
+        segments=final_segments,
     )
     validation_report = validate_script_segments(
         project_id=project_id,
         chunk_id=COMPLETE_SCRIPT_CHUNK_ID,
         source_text=complete_source,
-        segments=reviewed_segments,
+        segments=final_segments,
     )
     report = {
         "project_id": project_id,
@@ -283,6 +294,8 @@ def run_speaker_key_review_workflow(
         "candidate_count": len(candidates),
         "reviewed_count": len(reviewed_by_segment_id),
         "changed_count": changed_count,
+        "final_guard_changed_count": len(final_guard_events),
+        "final_guard_errors": final_guard_errors,
         "skipped_count": len(script_artifact.segments) - len(candidates),
         "events": review_events,
         "validation": validation_report.model_dump(),
@@ -292,6 +305,26 @@ def run_speaker_key_review_workflow(
     report_path = workspace.speaker_key_review_report_path(COMPLETE_SCRIPT_CHUNK_ID)
     write_json(output_path, reviewed_artifact)
     write_json(report_path, report)
+
+    if final_guard_errors:
+        _emit_progress(
+            progress_callback,
+            SpeakerKeyReviewProgress(
+                segment_id=None,
+                current_key=None,
+                processed_candidates=len(candidates),
+                total_candidates=len(candidates),
+                changed_count=changed_count,
+                candidate_elapsed_seconds=None,
+                total_elapsed_seconds=time.monotonic() - workflow_started_at,
+                status="failed",
+                errors=final_guard_errors,
+            ),
+        )
+        raise RuntimeError(
+            "Speaker key reviewed script contains keys outside characters.json: "
+            + "; ".join(final_guard_errors)
+        )
 
     if not validation_report.exact_reconstruction_success:
         _emit_progress(
@@ -344,7 +377,7 @@ def extract_speaker_key_review_candidates(
     *,
     canonical_names: set[str],
 ) -> list[SpeakerKeyReviewCandidate]:
-    skip_keys = {*canonical_names, "narrator"}
+    skip_keys = {*canonical_names, *RESERVED_REPLACEMENT_KEYS}
     candidates: list[SpeakerKeyReviewCandidate] = []
     for index, segment in enumerate(segments):
         if segment.speaker in skip_keys:
@@ -417,6 +450,74 @@ def _allowed_replacement_keys(registry: CharacterRegistryArtifact) -> list[str]:
             *RESERVED_REPLACEMENT_KEYS,
         ]
     )
+
+
+def _enforce_final_speaker_keys(
+    segments: list[ScriptSegment],
+    *,
+    registry: CharacterRegistryArtifact,
+) -> tuple[list[ScriptSegment], list[dict[str, Any]], list[str]]:
+    canonical_names = {record.canonical_name for record in registry.characters}
+    allowed_keys = {*canonical_names, *RESERVED_REPLACEMENT_KEYS}
+    alias_to_canonical = _stable_alias_map(registry)
+    output: list[ScriptSegment] = []
+    events: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for segment in segments:
+        speaker = segment.speaker
+        if speaker in allowed_keys:
+            output.append(segment)
+            continue
+        replacement = alias_to_canonical.get(speaker)
+        if replacement is None:
+            errors.append(f"{segment.segment_id}: {speaker}")
+            output.append(segment)
+            continue
+
+        event = {
+            "segment_id": segment.segment_id,
+            "current_key": speaker,
+            "decision": "replace",
+            "replacement_key": replacement,
+            "confidence": 1.0,
+            "evidence": [
+                f"characters.json lists {speaker!r} as a stable alias of {replacement!r}."
+            ],
+            "review_notes": ["Applied deterministic final speaker-key guard."],
+            "status": "deterministic_alias_applied",
+        }
+        events.append(event)
+        output.append(
+            ScriptSegment(
+                segment_id=segment.segment_id,
+                source_span=segment.source_span,
+                script={replacement: segment.text},
+                raw_script_key=segment.raw_script_key or speaker,
+                speaker_key_normalization=segment.speaker_key_normalization,
+                speaker_key_review={
+                    "from": speaker,
+                    "to": replacement,
+                    "decision": "deterministic_alias",
+                    "confidence": 1.0,
+                    "evidence": event["evidence"],
+                    "review_notes": event["review_notes"],
+                },
+                confidence=segment.confidence,
+                review_notes=segment.review_notes,
+            )
+        )
+    return output, events, errors
+
+
+def _stable_alias_map(registry: CharacterRegistryArtifact) -> dict[str, str]:
+    alias_to_canonical: dict[str, str] = {}
+    for record in registry.characters:
+        for alias in record.stable_aliases:
+            cleaned = alias.strip()
+            if cleaned and cleaned != record.canonical_name:
+                alias_to_canonical[cleaned] = record.canonical_name
+    return alias_to_canonical
 
 
 def _segment_prompt_payload(segment: ScriptSegment) -> dict[str, Any]:

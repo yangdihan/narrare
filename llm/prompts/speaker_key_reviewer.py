@@ -54,9 +54,12 @@ DECISION RULES:
 - Output one JSON object matching the schema.
 - Review only the script object key. Never rewrite the script object value.
 - The candidate script value must be treated as immutable source-derived text.
-- Use "replace" only when the evidence clearly supports a better key.
-- Use "keep" when the current key is acceptable or there is no stronger replacement.
-- Use "uncertain" when the evidence is ambiguous.
+- The final speaker key should be the canonical character name whenever the speaker can be identified unambiguously.
+- A non-canonical alias is not an acceptable final key merely because it correctly identifies the speaker.
+- If current_key exactly matches stable_aliases for exactly one character, use "replace" with that character's canonical_name.
+- If current_key is a contextual reference for exactly one character and local segment evidence confirms that identity, use "replace" with that character's canonical_name.
+- Use "keep" only when current_key should remain unchanged as a final key, or when no allowed replacement is better supported.
+- Use "uncertain" when multiple characters plausibly match or the evidence does not reliably identify one character.
 - If decision is "replace", replacement_key must be exactly one entry from allowed_replacement_keys.
 - If decision is "keep" or "uncertain", replacement_key must be null.
 - Allowed replacement keys are canonical character names, "narrator", and "unknown_speaker".
@@ -64,9 +67,10 @@ DECISION RULES:
 - Do not output character_id values as speaker keys.
 - Stage 1 scene context and character debriefs are speaker-attribution evidence only.
 - Stage 1 context is not a source for script values.
-- Prefer a canonical character name only when local scene evidence supports it.
 - Contextual references such as honorifics, role titles, relationship titles, pronouns, and descriptive phrases are local evidence, not globally safe aliases.
 - If multiple characters could match the current key, return "uncertain" or replace with "unknown_speaker" only when that is better than the current key.
+- Before returning "keep", verify that the evidence does not establish current_key as a stable alias of exactly one canonical character.
+- If the evidence establishes that current_key is a stable alias of exactly one character, the decision must be "replace" and replacement_key must be that character's canonical_name.
 - Keep evidence concise and quote only short identifying clues.
 
 Return valid JSON only.
