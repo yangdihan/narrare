@@ -60,6 +60,10 @@ class ScriptArtifact(BaseModel):
     llm_provider: str
     llm_model: str
     response_source: Literal["llm", "response_path", "assembled", "speaker_key_review"]
+    # Derived artifacts record the exact base script revision they came from.
+    # This lets consumers avoid accidentally using a stale review after Stage 2
+    # has been reassembled.
+    source_script_revision: str | None = None
     processed_chunk_count: int = Field(ge=0)
     segments: list[ScriptSegment]
 
@@ -82,12 +86,11 @@ class ScriptValidationReport(BaseModel):
 
 class SpeakerKeyReviewResponse(BaseModel):
     segment_id: str
-    current_key: str
+    current_key: str | None = None
     decision: Literal["keep", "replace", "uncertain"]
     replacement_key: str | None = None
     confidence: float = Field(ge=0.0, le=1.0)
-    evidence: list[str] = Field(default_factory=list)
-    review_notes: list[str] = Field(default_factory=list)
+    reason_code: str | None = None
 
     @model_validator(mode="after")
     def ensure_replace_has_replacement(self) -> "SpeakerKeyReviewResponse":

@@ -308,7 +308,11 @@ def _convert_script_chunk(
         validation_report.errors.extend(alignment_errors)
 
         if validation_report.exact_reconstruction_success and not alignment_errors:
-            segments = merge_consecutive_same_speaker(segments, starting_index=0)
+            segments = merge_consecutive_same_speaker(
+                segments,
+                starting_index=0,
+                source_text=chunk_text,
+            )
             validation_report = validate_script_segments(
                 project_id=project_id,
                 chunk_id=chunk_id,
@@ -524,7 +528,9 @@ def _run_shrinking_repair(
             ]
         )
         assembled_segments = merge_consecutive_same_speaker(
-            assembled_segments, starting_index=0
+            assembled_segments,
+            starting_index=0,
+            source_text=chunk_text,
         )
         full_validation_report = validate_script_segments(
             project_id=project_id,
