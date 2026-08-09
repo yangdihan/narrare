@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-import time
-from typing import Any, Callable
+from typing import Any
 
 from config.loader import load_config
 from config.models import AppConfig
+from core.ir.script_revision import script_artifact_revision
 from core.models.character import (
     AliasEvidence,
     CharacterRecord,
@@ -20,20 +23,26 @@ from core.models.ir import (
     SpeakerKeyReviewResponse,
 )
 from core.pipeline.script_assembly import COMPLETE_SCRIPT_CHUNK_ID
+from core.pipeline.speaker_key_normalization import (
+    DEFAULT_ALIAS_CONFIDENCE_THRESHOLD,
+    run_speaker_key_normalization_workflow,
+)
 from core.validation.script_integrity import validate_script_segments
 from llm.json_utils import parse_json_object_response
 from llm.prompts.speaker_key_reviewer import (
     SYSTEM_PROMPT,
-    build_speaker_key_reviewer_user_prompt,
+    build_speaker_key_reviewer_batch_user_prompt,
 )
 from llm.schemas import LlmCompletion
 from llm.service import LlmService
 from storage.json_store import write_json
 from storage.workspace import Workspace
 
-
 RESERVED_REPLACEMENT_KEYS = ["narrator", "unknown_speaker"]
 DEFAULT_REVIEW_CONFIDENCE_THRESHOLD = 0.85
+DEFAULT_REVIEW_BATCH_SIZE = 16
+DEFAULT_REVIEW_MAX_OUTPUT_TOKENS = 2_400
+DEFAULT_REVIEW_REASONING_EFFORT = "minimal"
 
 
 @dataclass(frozen=True)
@@ -53,6 +62,11 @@ class SpeakerKeyReviewResult:
     skipped_count: int
     exact_reconstruction_success: bool
     errors: list[str]
+    deterministic_renamed_count: int = 0
+    unresolved_count: int = 0
+    llm_batch_count: int = 0
+    prompt_tokens: int = 0
+    output_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -79,15 +93,33 @@ def run_speaker_key_review_workflow(
     workspace_root: str | Path = "data/interim",
     llm_service: LlmService | None = None,
     confidence_threshold: float = DEFAULT_REVIEW_CONFIDENCE_THRESHOLD,
+    batch_size: int = DEFAULT_REVIEW_BATCH_SIZE,
+    max_output_tokens: int = DEFAULT_REVIEW_MAX_OUTPUT_TOKENS,
+    reasoning_effort: str = DEFAULT_REVIEW_REASONING_EFFORT,
     progress_callback: SpeakerKeyReviewProgressCallback | None = None,
 ) -> SpeakerKeyReviewResult:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if max_output_tokens <= 0:
+        raise ValueError("max_output_tokens must be positive")
+    if reasoning_effort not in {"none", "minimal", "low", "medium", "high"}:
+        raise ValueError("reasoning_effort must be none, minimal, low, medium, or high")
     workflow_started_at = time.monotonic()
     app_config = config or load_config()
     workspace = Workspace(project_id, root=workspace_root)
     workspace.ensure()
 
-    script_artifact = _read_script_artifact(
+    original_script_artifact = _read_script_artifact(
         workspace.script_artifact_path(COMPLETE_SCRIPT_CHUNK_ID)
+    )
+    normalization_result = run_speaker_key_normalization_workflow(
+        project_id,
+        workspace_root=workspace_root,
+        alias_confidence_threshold=DEFAULT_ALIAS_CONFIDENCE_THRESHOLD,
+    )
+    script_artifact = normalization_result.artifact
+    normalization_report = json.loads(
+        normalization_result.report_path.read_text(encoding="utf-8")
     )
     chunks_artifact = _read_chunks_artifact(workspace.chunks_path)
     registry = _read_registry(workspace.character_registry_path, project_id)
@@ -122,14 +154,57 @@ def run_speaker_key_review_workflow(
         ),
     )
 
-    for index, candidate in enumerate(candidates):
+    batches = _batch_candidates_by_chunk(candidates, chunks_artifact.chunks, batch_size)
+    prompt_tokens = 0
+    output_tokens = 0
+    if not batches and normalization_result.renamed_count:
+        normalized = next(
+            (
+                segment
+                for segment in script_artifact.segments
+                if segment.speaker_key_normalization is not None
+            ),
+            None,
+        )
+        if normalized is not None:
+            raw_key = str(normalized.speaker_key_normalization["from"])
+            _emit_progress(
+                progress_callback,
+                SpeakerKeyReviewProgress(
+                    segment_id=normalized.segment_id,
+                    current_key=raw_key,
+                    processed_candidates=0,
+                    total_candidates=0,
+                    changed_count=normalization_result.renamed_count,
+                    candidate_elapsed_seconds=0.0,
+                    total_elapsed_seconds=time.monotonic() - workflow_started_at,
+                    status="candidate_started",
+                    errors=[],
+                ),
+            )
+            _emit_progress(
+                progress_callback,
+                SpeakerKeyReviewProgress(
+                    segment_id=normalized.segment_id,
+                    current_key=raw_key,
+                    processed_candidates=1,
+                    total_candidates=0,
+                    changed_count=normalization_result.renamed_count,
+                    candidate_elapsed_seconds=0.0,
+                    total_elapsed_seconds=time.monotonic() - workflow_started_at,
+                    status="candidate_complete",
+                    errors=[],
+                ),
+            )
+    for batch_index, batch in enumerate(batches):
         candidate_started_at = time.monotonic()
+        first_candidate = batch[0]
         _emit_progress(
             progress_callback,
             SpeakerKeyReviewProgress(
-                segment_id=candidate.segment.segment_id,
-                current_key=candidate.segment.speaker,
-                processed_candidates=index,
+                segment_id=first_candidate.segment.segment_id,
+                current_key=first_candidate.segment.speaker,
+                processed_candidates=sum(len(item) for item in batches[:batch_index]),
                 total_candidates=len(candidates),
                 changed_count=applied_count,
                 candidate_elapsed_seconds=0.0,
@@ -138,47 +213,39 @@ def run_speaker_key_review_workflow(
                 errors=[],
             ),
         )
-        prompt = build_speaker_key_reviewer_user_prompt(
-            segment=_segment_prompt_payload(candidate.segment),
-            previous_segment=_optional_segment_prompt_payload(
-                candidate.previous_segment
+        prompt = build_speaker_key_reviewer_batch_user_prompt(
+            candidates=[_batch_candidate_payload(candidate) for candidate in batch],
+            scene_context=_batch_scene_context_payload(
+                batch, chunks_artifact.chunks, contexts
             ),
-            next_segment=_optional_segment_prompt_payload(candidate.next_segment),
-            scene_context=_scene_context_payload(
-                candidate.segment,
-                chunks_artifact.chunks,
-                contexts,
-            ),
-            relevant_characters=_relevant_character_payloads(
-                candidate,
-                registry.characters,
-                _context_for_segment(candidate.segment, chunks_artifact.chunks, contexts),
+            relevant_characters=_batch_relevant_character_payloads(
+                batch, registry.characters, chunks_artifact.chunks, contexts
             ),
             allowed_replacement_keys=allowed_replacement_keys,
             confidence_threshold=confidence_threshold,
         )
         completion = _complete_key_review(
-            segment_id=candidate.segment.segment_id,
+            batch_id=_batch_id(batch_index, batch, chunks_artifact.chunks),
             response_dir=response_dir,
             llm_service=service,
             system_prompt=SYSTEM_PROMPT,
             user_prompt=prompt,
+            max_output_tokens=max_output_tokens,
+            reasoning_effort=reasoning_effort,
+            candidate_segment_ids=[candidate.segment.segment_id for candidate in batch],
         )
-        raw_path = workspace.speaker_key_review_raw_response_path(
-            candidate.segment.segment_id
-        )
+        batch_id = _batch_id(batch_index, batch, chunks_artifact.chunks)
+        raw_path = workspace.speaker_key_review_raw_response_path(batch_id)
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         raw_path.write_text(completion.content.strip() + "\n", encoding="utf-8")
 
         try:
-            response_data = parse_json_object_response(completion.content)
-            review = SpeakerKeyReviewResponse.model_validate(response_data)
+            reviews = _parse_batch_reviews(completion.content, batch)
         except Exception as exc:
             errors = [f"invalid speaker key review JSON: {exc}"]
             review_events.append(
                 {
-                    "segment_id": candidate.segment.segment_id,
-                    "current_key": candidate.segment.speaker,
+                    "batch_id": batch_id,
                     "status": "invalid_response",
                     "error": str(exc),
                 }
@@ -186,9 +253,11 @@ def run_speaker_key_review_workflow(
             _emit_progress(
                 progress_callback,
                 SpeakerKeyReviewProgress(
-                    segment_id=candidate.segment.segment_id,
-                    current_key=candidate.segment.speaker,
-                    processed_candidates=index + 1,
+                    segment_id=first_candidate.segment.segment_id,
+                    current_key=first_candidate.segment.speaker,
+                    processed_candidates=sum(
+                        len(item) for item in batches[: batch_index + 1]
+                    ),
                     total_candidates=len(candidates),
                     changed_count=applied_count,
                     candidate_elapsed_seconds=time.monotonic() - candidate_started_at,
@@ -199,22 +268,29 @@ def run_speaker_key_review_workflow(
             )
             continue
 
-        reviewed_by_segment_id[candidate.segment.segment_id] = review
-        event = _review_event(
-            candidate.segment,
-            review,
-            allowed_replacement_keys=set(allowed_replacement_keys),
-            confidence_threshold=confidence_threshold,
+        prompt_tokens += completion.prompt_tokens or _estimate_tokens(prompt)
+        output_tokens += completion.completion_tokens or _estimate_tokens(
+            completion.content
         )
-        review_events.append(event)
-        if event["status"] == "applied":
-            applied_count += 1
+        for candidate, review in zip(batch, reviews):
+            reviewed_by_segment_id[candidate.segment.segment_id] = review
+            event = _review_event(
+                candidate.segment,
+                review,
+                allowed_replacement_keys=set(allowed_replacement_keys),
+                confidence_threshold=confidence_threshold,
+            )
+            review_events.append(event)
+            if event["status"] == "applied":
+                applied_count += 1
         _emit_progress(
             progress_callback,
             SpeakerKeyReviewProgress(
-                segment_id=candidate.segment.segment_id,
-                current_key=candidate.segment.speaker,
-                processed_candidates=index + 1,
+                segment_id=first_candidate.segment.segment_id,
+                current_key=first_candidate.segment.speaker,
+                processed_candidates=sum(
+                    len(item) for item in batches[: batch_index + 1]
+                ),
                 total_candidates=len(candidates),
                 changed_count=applied_count,
                 candidate_elapsed_seconds=time.monotonic() - candidate_started_at,
@@ -227,7 +303,9 @@ def run_speaker_key_review_workflow(
     reviewed_segments: list[ScriptSegment] = []
     changed_count = 0
     event_by_segment_id = {
-        str(event["segment_id"]): event for event in review_events if "segment_id" in event
+        str(event["segment_id"]): event
+        for event in review_events
+        if "segment_id" in event
     }
     for segment in script_artifact.segments:
         review = reviewed_by_segment_id.get(segment.segment_id)
@@ -250,22 +328,23 @@ def run_speaker_key_review_workflow(
                     "to": replacement_key,
                     "decision": review.decision,
                     "confidence": review.confidence,
-                    "evidence": review.evidence,
-                    "review_notes": review.review_notes,
+                    "reason_code": review.reason_code,
                 },
                 confidence=segment.confidence,
                 review_notes=segment.review_notes,
             )
         )
 
-    final_segments, final_guard_events, final_guard_errors = _enforce_final_speaker_keys(
-        reviewed_segments,
-        registry=registry,
+    final_segments, final_guard_events, final_guard_errors = (
+        _enforce_final_speaker_keys(
+            reviewed_segments,
+            registry=registry,
+        )
     )
     review_events.extend(final_guard_events)
     changed_count = sum(
         1
-        for original, reviewed in zip(script_artifact.segments, final_segments)
+        for original, reviewed in zip(original_script_artifact.segments, final_segments)
         if original.speaker != reviewed.speaker
     )
 
@@ -277,6 +356,7 @@ def run_speaker_key_review_workflow(
         llm_provider=script_artifact.llm_provider,
         llm_model=script_artifact.llm_model,
         response_source="speaker_key_review",
+        source_script_revision=script_artifact_revision(original_script_artifact),
         processed_chunk_count=script_artifact.processed_chunk_count,
         segments=final_segments,
     )
@@ -290,7 +370,18 @@ def run_speaker_key_review_workflow(
         "project_id": project_id,
         "chunk_id": COMPLETE_SCRIPT_CHUNK_ID,
         "confidence_threshold": confidence_threshold,
+        "batch_size": batch_size,
+        "max_output_tokens": max_output_tokens,
+        "reasoning_effort": reasoning_effort,
+        "source_script_revision": reviewed_artifact.source_script_revision,
         "canonical_speaker_count": len(canonical_names),
+        "deterministic_renamed_count": normalization_result.renamed_count,
+        "deterministic_events": normalization_report.get("renamed", []),
+        "deterministic_unresolved": normalization_report.get("unresolved", []),
+        "unresolved_count": len(candidates),
+        "llm_batch_count": len(batches),
+        "estimated_prompt_tokens": prompt_tokens,
+        "estimated_output_tokens": output_tokens,
         "candidate_count": len(candidates),
         "reviewed_count": len(reviewed_by_segment_id),
         "changed_count": changed_count,
@@ -369,6 +460,11 @@ def run_speaker_key_review_workflow(
         skipped_count=len(script_artifact.segments) - len(candidates),
         exact_reconstruction_success=validation_report.exact_reconstruction_success,
         errors=validation_report.errors,
+        deterministic_renamed_count=normalization_result.renamed_count,
+        unresolved_count=len(candidates),
+        llm_batch_count=len(batches),
+        prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens,
     )
 
 
@@ -392,21 +488,150 @@ def extract_speaker_key_review_candidates(
     return candidates
 
 
+def _batch_candidates_by_chunk(
+    candidates: list[SpeakerKeyReviewCandidate],
+    chunks: list[TextChunk],
+    batch_size: int,
+) -> list[list[SpeakerKeyReviewCandidate]]:
+    by_chunk: dict[str, list[SpeakerKeyReviewCandidate]] = {}
+    for candidate in candidates:
+        chunk_id = _chunks_for_segment(candidate.segment, chunks)[0].chunk_id
+        by_chunk.setdefault(chunk_id, []).append(candidate)
+    return [
+        group[index : index + batch_size]
+        for group in by_chunk.values()
+        for index in range(0, len(group), batch_size)
+    ]
+
+
+def _batch_id(
+    batch_index: int,
+    batch: list[SpeakerKeyReviewCandidate],
+    chunks: list[TextChunk],
+) -> str:
+    chunk_id = _chunks_for_segment(batch[0].segment, chunks)[0].chunk_id
+    return f"batch_{chunk_id}_{batch_index + 1:04d}"
+
+
+def _batch_candidate_payload(candidate: SpeakerKeyReviewCandidate) -> dict[str, Any]:
+    return {
+        "segment_id": candidate.segment.segment_id,
+        "speaker_key": candidate.segment.speaker,
+        "text": candidate.segment.text,
+        "previous_speaker": (
+            candidate.previous_segment.speaker if candidate.previous_segment else None
+        ),
+        "next_speaker": (
+            candidate.next_segment.speaker if candidate.next_segment else None
+        ),
+    }
+
+
+def _batch_scene_context_payload(
+    batch: list[SpeakerKeyReviewCandidate],
+    chunks: list[TextChunk],
+    contexts: dict[str, ChunkContextArtifact],
+) -> dict[str, Any]:
+    chunk = _chunks_for_segment(batch[0].segment, chunks)[0]
+    context = contexts[chunk.chunk_id].context
+    return {
+        "chunk_id": chunk.chunk_id,
+        "scene_summary": context.scene_summary,
+        "active_characters": context.active_characters,
+        "aliases_observed": [
+            {
+                "text": item.text,
+                "likely_character_id": item.likely_character_id,
+                "confidence": item.confidence,
+            }
+            for item in context.aliases_observed
+        ],
+        "important_context": context.important_context,
+    }
+
+
+def _batch_relevant_character_payloads(
+    batch: list[SpeakerKeyReviewCandidate],
+    records: list[CharacterRecord],
+    chunks: list[TextChunk],
+    contexts: dict[str, ChunkContextArtifact],
+) -> list[dict[str, Any]]:
+    context = _context_for_segment(batch[0].segment, chunks, contexts)
+    selected: dict[str, dict[str, Any]] = {}
+    for candidate in batch:
+        for payload in _relevant_character_payloads(candidate, records, context):
+            selected[str(payload["character_id"])] = {
+                "character_id": payload["character_id"],
+                "canonical_name": payload["canonical_name"],
+                "stable_aliases": payload["stable_aliases"],
+                "contextual_references": payload["contextual_references"],
+            }
+    return list(selected.values())[:12]
+
+
+def _parse_batch_reviews(
+    content: str,
+    batch: list[SpeakerKeyReviewCandidate],
+) -> list[SpeakerKeyReviewResponse]:
+    data = parse_json_object_response(content)
+    items = data.get("reviews")
+    if not isinstance(items, list):
+        raise ValueError("batch response must contain a reviews list")
+    reviews = [SpeakerKeyReviewResponse.model_validate(item) for item in items]
+    expected = [candidate.segment.segment_id for candidate in batch]
+    actual = [review.segment_id for review in reviews]
+    if actual != expected:
+        raise ValueError(
+            f"batch review segment_ids must match request order: {expected}"
+        )
+    for candidate, review in zip(batch, reviews):
+        if review.current_key is None:
+            review.current_key = candidate.segment.speaker
+    return reviews
+
+
+def _estimate_tokens(text: str) -> int:
+    # A conservative provider-independent estimate for cost visibility.
+    return max(1, (len(text) + 3) // 4)
+
+
 def _complete_key_review(
     *,
-    segment_id: str,
+    batch_id: str,
     response_dir: str | Path | None,
     llm_service: LlmService | None,
     system_prompt: str,
     user_prompt: str,
+    max_output_tokens: int,
+    reasoning_effort: str,
+    candidate_segment_ids: list[str],
 ) -> LlmCompletion:
     if response_dir is not None:
-        response_path = Path(response_dir) / f"{segment_id}_response.json"
-        if not response_path.exists():
-            raise RuntimeError(f"Missing Stage 3 response fixture: {response_path}")
-        return LlmCompletion(content=response_path.read_text(encoding="utf-8"))
+        response_path = Path(response_dir) / f"{batch_id}_response.json"
+        if response_path.exists():
+            return LlmCompletion(content=response_path.read_text(encoding="utf-8"))
+        legacy_responses = []
+        for segment_id in candidate_segment_ids:
+            legacy_path = Path(response_dir) / f"{segment_id}_response.json"
+            if not legacy_path.exists():
+                raise RuntimeError(
+                    f"Missing Stage 3 batch response fixture: {response_path}"
+                )
+            legacy_responses.append(
+                parse_json_object_response(legacy_path.read_text(encoding="utf-8"))
+            )
+        return LlmCompletion(
+            content=json.dumps({"reviews": legacy_responses}, ensure_ascii=False)
+        )
     if llm_service is None:
         raise RuntimeError("llm_service is required for live Stage 3 key review")
+    if isinstance(llm_service, LlmService):
+        return llm_service.complete_json_with_output_limit(
+            system_prompt,
+            user_prompt,
+            max_output_tokens=max_output_tokens,
+            reasoning_effort=reasoning_effort,
+        )
     return llm_service.complete_json(system_prompt, user_prompt)
 
 
@@ -423,10 +648,9 @@ def _review_event(
         "decision": review.decision,
         "replacement_key": review.replacement_key,
         "confidence": review.confidence,
-        "evidence": review.evidence,
-        "review_notes": review.review_notes,
+        "reason_code": review.reason_code,
     }
-    if review.current_key != segment.speaker:
+    if review.current_key is not None and review.current_key != segment.speaker:
         event["status"] = "current_key_mismatch"
         return event
     if review.decision != "replace":
@@ -549,23 +773,15 @@ def _scene_context_payload(
             {
                 "chunk_id": chunk.chunk_id,
                 "scene_summary": contexts[chunk.chunk_id].context.scene_summary,
-                "active_characters": contexts[
-                    chunk.chunk_id
-                ].context.active_characters,
+                "active_characters": contexts[chunk.chunk_id].context.active_characters,
                 "aliases_observed": [
                     observation.model_dump()
-                    for observation in contexts[
-                        chunk.chunk_id
-                    ].context.aliases_observed
+                    for observation in contexts[chunk.chunk_id].context.aliases_observed
                 ],
-                "important_context": contexts[
-                    chunk.chunk_id
-                ].context.important_context,
+                "important_context": contexts[chunk.chunk_id].context.important_context,
                 "unresolved_pronouns": [
                     pronoun.model_dump()
-                    for pronoun in contexts[
-                        chunk.chunk_id
-                    ].context.unresolved_pronouns
+                    for pronoun in contexts[chunk.chunk_id].context.unresolved_pronouns
                 ],
                 "review_notes": contexts[chunk.chunk_id].context.review_notes,
             }
@@ -644,7 +860,9 @@ def _reference_payload(reference: AliasEvidence) -> dict[str, Any]:
     }
 
 
-def _chunks_for_segment(segment: ScriptSegment, chunks: list[TextChunk]) -> list[TextChunk]:
+def _chunks_for_segment(
+    segment: ScriptSegment, chunks: list[TextChunk]
+) -> list[TextChunk]:
     matched: list[TextChunk] = []
     cursor = 0
     for chunk in chunks:

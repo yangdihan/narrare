@@ -1,25 +1,32 @@
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
-from core.models.chunk import ChunkingConfig
 from core.models.character import (
     AliasEvidence,
+    CharacterCurationAddition,
+    CharacterCurationUpdate,
     CharacterRecord,
     CharacterRegistryArtifact,
 )
+from core.models.chunk import ChunkingConfig
 from core.models.ir import ScriptArtifact, ScriptSegment
 from core.models.source import SourceSpan
-from core.pipeline.chunking import run_chunking_workflow
+from core.models.voice import VoiceAssignment, VoiceAssignmentArtifact
+from core.pipeline.character_review import (
+    add_character,
+    apply_character_curation,
+    apply_script_content_edits,
+    merge_character,
+    speaker_options,
+    update_script_segment_speaker,
+)
 from core.pipeline.chunk_context_profiler import (
     ContextProfileProgress,
     build_stage1_context_hint,
     run_chunk_context_profiler_workflow,
 )
-from core.pipeline.character_review import (
-    add_character,
-    merge_character,
-    update_script_segment_speaker,
-)
+from core.pipeline.chunking import run_chunking_workflow
 from core.pipeline.script_assembly import run_script_assembly_workflow
 from core.pipeline.script_conversion import run_script_conversion_workflow
 from core.pipeline.speaker_key_normalization import (
@@ -31,9 +38,9 @@ from core.pipeline.speaker_key_review import (
     run_speaker_key_review_workflow,
 )
 from core.validation.script_integrity import sha256_text
+from llm.prompts.script_converter import build_script_converter_user_prompt
 from llm.prompts.speaker_key_reviewer import build_speaker_key_reviewer_user_prompt
 from llm.schemas import LlmCompletion
-from llm.prompts.script_converter import build_script_converter_user_prompt
 from storage.json_store import write_json
 from storage.workspace import Workspace
 
@@ -807,13 +814,23 @@ def test_speaker_key_review_applies_high_confidence_key_only_change(
     assert reviewed.raw_script_key == "马丁先生"
     assert reviewed.speaker_key_review is not None
     assert reviewed.speaker_key_review["to"] == "安德鲁·马丁"
+    assert "evidence" not in reviewed.speaker_key_review
+    assert "review_notes" not in reviewed.speaker_key_review
     assert reviewed.segment_id == "seg_000002"
     assert reviewed.source_span == SourceSpan(start=2, end=4)
     assert reviewed.confidence == 0.82
     assert reviewed.review_notes == ["raw speaker key from Stage 2"]
     assert workspace.key_reviewed_script_artifact_path("complete").exists()
+    reviewed_artifact = ScriptArtifact.model_validate_json(
+        workspace.key_reviewed_script_artifact_path("complete").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert reviewed_artifact.source_script_revision is not None
     assert workspace.speaker_key_review_report_path("complete").exists()
-    assert workspace.speaker_key_review_raw_response_path("seg_000002").exists()
+    assert workspace.speaker_key_review_raw_response_path(
+        "batch_chunk_0001_0001"
+    ).exists()
 
 
 def test_speaker_key_review_emits_progress_events(
@@ -853,10 +870,64 @@ def test_speaker_key_review_emits_progress_events(
         "candidate_complete",
         "complete",
     ]
-    assert progress_events[1].segment_id == "seg_000002"
+    assert progress_events[-1].segment_id is None
     assert progress_events[1].current_key == "安德鲁"
-    assert progress_events[2].processed_candidates == 1
-    assert progress_events[-1].total_candidates == 1
+    assert progress_events[-1].total_candidates == 0
+
+
+def test_speaker_key_review_batches_unresolved_candidates_by_chunk(
+    tmp_path: Path,
+) -> None:
+    workspace_root, _ = write_stage3_review_fixture(tmp_path)
+    workspace = Workspace("fixture_project", root=workspace_root)
+    artifact = ScriptArtifact.model_validate_json(
+        workspace.script_artifact_path("complete").read_text(encoding="utf-8")
+    )
+    artifact.segments[0] = artifact.segments[0].model_copy(
+        update={"script": {"unresolved_a": artifact.segments[0].text}}
+    )
+    artifact.segments[1] = artifact.segments[1].model_copy(
+        update={"script": {"unresolved_b": artifact.segments[1].text}}
+    )
+    write_json(workspace.script_artifact_path("complete"), artifact)
+    canonical_name = json.loads(
+        workspace.character_registry_path.read_text(encoding="utf-8")
+    )["characters"][0]["canonical_name"]
+    service = SequentialLlmService(
+        [
+            {
+                "reviews": [
+                    {
+                        "segment_id": "seg_000001",
+                        "decision": "replace",
+                        "replacement_key": canonical_name,
+                        "confidence": 0.95,
+                        "reason_code": "local_context_match",
+                    },
+                    {
+                        "segment_id": "seg_000002",
+                        "decision": "replace",
+                        "replacement_key": canonical_name,
+                        "confidence": 0.95,
+                        "reason_code": "local_context_match",
+                    },
+                ]
+            }
+        ]
+    )
+
+    result = run_speaker_key_review_workflow(
+        "fixture_project",
+        workspace_root=workspace_root,
+        llm_service=service,
+        batch_size=16,
+    )
+
+    assert len(service.prompts) == 1
+    assert result.llm_batch_count == 1
+    assert result.reviewed_count == 2
+    assert result.artifact.segments[0].speaker == canonical_name
+    assert result.artifact.segments[0].text == artifact.segments[0].text
 
 
 def test_speaker_key_review_folds_known_alias_even_when_llm_confidence_is_low(
@@ -892,9 +963,9 @@ def test_speaker_key_review_folds_known_alias_even_when_llm_confidence_is_low(
     assert result.changed_count == 1
     assert result.artifact.segments[1].script == {"安德鲁·马丁": "你好"}
     assert result.artifact.segments[1].raw_script_key == "安德鲁"
-    assert report["events"][0]["status"] == "low_confidence"
-    assert report["events"][1]["status"] == "deterministic_alias_applied"
-    assert report["final_guard_changed_count"] == 1
+    assert result.reviewed_count == 0
+    assert report["deterministic_renamed_count"] == 1
+    assert report["final_guard_changed_count"] == 0
 
 
 def test_speaker_key_review_rejects_final_keys_outside_character_registry(
@@ -1176,3 +1247,272 @@ def test_character_review_add_merge_and_script_reassignment_update_artifacts(
         workspace.script_artifact_path("complete").read_text(encoding="utf-8")
     )
     assert [segment.speaker for segment in script.segments] == ["奇丽星", "法官"]
+
+
+def test_manual_script_edit_splits_segment_without_renumbering_existing_ids(
+    tmp_path: Path,
+) -> None:
+    workspace = Workspace("fixture_project", root=tmp_path / "interim")
+    workspace.ensure()
+    source_text = "甲乙\n\n　　丙丁"
+    write_json(workspace.chunks_path, {"chunks": [{"text": source_text}]})
+    write_json(
+        workspace.character_registry_path,
+        CharacterRegistryArtifact(
+            project_id="fixture_project",
+            characters=[
+                CharacterRecord(
+                    character_id="character_001",
+                    canonical_name="角色",
+                    stable_aliases=["角色"],
+                    confidence=1.0,
+                )
+            ],
+        ),
+    )
+    script_path = workspace.script_artifact_path("complete")
+    write_json(
+        script_path,
+        ScriptArtifact(
+            project_id="fixture_project",
+            chunk_id="complete",
+            chunk_source_path=str(workspace.chunks_path),
+            chunk_sha256="unused",
+            llm_provider="test",
+            llm_model="test",
+            response_source="assembled",
+            processed_chunk_count=1,
+            segments=[
+                ScriptSegment(
+                    segment_id="seg_000001",
+                    source_span=SourceSpan(start=0, end=4),
+                    script={"narrator": "甲乙丙丁"},
+                    confidence=0.9,
+                )
+            ],
+        ),
+    )
+    now = datetime.now(UTC)
+    write_json(
+        workspace.voice_assignments_path,
+        VoiceAssignmentArtifact(
+            project_id="fixture_project",
+            script_artifact_path=str(script_path),
+            created_at=now,
+            updated_at=now,
+            assignments=[
+                VoiceAssignment(
+                    speaker="narrator",
+                    voice_profile_id="voice_a",
+                    confirmed=True,
+                )
+            ],
+        ),
+    )
+
+    apply_script_content_edits(
+        "fixture_project",
+        [("seg_000001", "narrator", "甲乙", "complete")],
+        [("seg_000001", "角色", "丙丁", "complete")],
+        workspace_root=workspace.root,
+    )
+
+    artifact = ScriptArtifact.model_validate_json(script_path.read_text(encoding="utf-8"))
+    assert [segment.segment_id for segment in artifact.segments[:1]] == ["seg_000001"]
+    assert artifact.segments[1].segment_id.startswith("manual_")
+    assert [segment.text for segment in artifact.segments] == ["甲乙", "丙丁"]
+    assert [segment.source_span.model_dump() for segment in artifact.segments] == [
+        {"start": 0, "end": 2},
+        {"start": 2, "end": 8},
+    ]
+    report = json.loads(
+        workspace.script_validation_report_path("complete").read_text(encoding="utf-8")
+    )
+    assert report["exact_reconstruction_success"] is True
+    assignments = VoiceAssignmentArtifact.model_validate_json(
+        workspace.voice_assignments_path.read_text(encoding="utf-8")
+    )
+    by_speaker = {assignment.speaker: assignment for assignment in assignments.assignments}
+    assert by_speaker["narrator"].voice_profile_id == "voice_a"
+    assert "角色" in by_speaker
+
+
+def test_manual_insert_can_reuse_an_existing_script_only_speaker_key(
+    tmp_path: Path,
+) -> None:
+    workspace = Workspace("fixture_project", root=tmp_path / "interim")
+    workspace.ensure()
+    write_json(workspace.chunks_path, {"chunks": [{"text": "abcd"}]})
+    write_json(
+        workspace.character_registry_path,
+        CharacterRegistryArtifact(project_id="fixture_project"),
+    )
+    script_path = workspace.script_artifact_path("complete")
+    write_json(
+        script_path,
+        ScriptArtifact(
+            project_id="fixture_project",
+            chunk_id="complete",
+            chunk_source_path=str(workspace.chunks_path),
+            chunk_sha256="unused",
+            llm_provider="test",
+            llm_model="test",
+            response_source="assembled",
+            processed_chunk_count=1,
+            segments=[
+                ScriptSegment(
+                    segment_id="seg_000001",
+                    source_span=SourceSpan(start=0, end=2),
+                    script={"LegacyKey": "ab"},
+                    confidence=0.9,
+                ),
+                ScriptSegment(
+                    segment_id="seg_000002",
+                    source_span=SourceSpan(start=2, end=4),
+                    script={"narrator": "cd"},
+                    confidence=0.9,
+                ),
+            ],
+        ),
+    )
+
+    apply_script_content_edits(
+        "fixture_project",
+        [("seg_000001", "LegacyKey", "a", "complete")],
+        [("seg_000001", "LegacyKey", "b", "complete")],
+        workspace_root=workspace.root,
+    )
+
+    artifact = ScriptArtifact.model_validate_json(script_path.read_text(encoding="utf-8"))
+    assert [segment.speaker for segment in artifact.segments] == [
+        "LegacyKey",
+        "LegacyKey",
+        "narrator",
+    ]
+    assert [segment.text for segment in artifact.segments] == ["a", "b", "cd"]
+
+
+def test_character_curation_synchronizes_registry_dependents(
+    tmp_path: Path,
+) -> None:
+    workspace = Workspace("fixture_project", root=tmp_path / "interim")
+    workspace.ensure()
+    source_text = "甲乙丙丁"
+    write_json(workspace.chunks_path, {"chunks": [{"text": source_text}]})
+    write_json(
+        workspace.character_registry_path,
+        CharacterRegistryArtifact(
+            project_id="fixture_project",
+            characters=[
+                CharacterRecord(
+                    character_id="character_001",
+                    canonical_name="甲",
+                    stable_aliases=["甲"],
+                    confidence=0.6,
+                ),
+                CharacterRecord(
+                    character_id="character_002",
+                    canonical_name="乙",
+                    stable_aliases=["乙"],
+                    confidence=0.9,
+                ),
+            ],
+        ),
+    )
+    write_json(
+        workspace.context_artifact_path("chunk_0001"),
+        {
+            "chunk_id": "chunk_0001",
+            "context": {
+                "active_characters": ["甲", "乙"],
+                "aliases_observed": [],
+                "unresolved_pronouns": [],
+            },
+        },
+    )
+    write_json(
+        workspace.script_artifact_path("complete"),
+        ScriptArtifact(
+            project_id="fixture_project",
+            chunk_id="complete",
+            chunk_source_path=str(workspace.chunks_path),
+            chunk_sha256="unused",
+            llm_provider="test",
+            llm_model="test",
+            response_source="assembled",
+            processed_chunk_count=1,
+            segments=[
+                ScriptSegment(
+                    segment_id="seg_000001",
+                    source_span=SourceSpan(start=0, end=2),
+                    script={"甲": "甲乙"},
+                    confidence=0.9,
+                ),
+                ScriptSegment(
+                    segment_id="seg_000002",
+                    source_span=SourceSpan(start=2, end=4),
+                    script={"乙": "丙丁"},
+                    confidence=0.9,
+                ),
+            ],
+        ),
+    )
+
+    apply_character_curation(
+        "fixture_project",
+        additions=[
+            CharacterCurationAddition(
+                canonical_name="Gamma",
+                stable_aliases=["Gamma", "G."],
+                persona_summary="Human-added supporting character",
+                speaking_style="Measured",
+                age_impression="Adult",
+                voice_variant_notes=["Neutral delivery"],
+            )
+        ],
+        updates=[
+            CharacterCurationUpdate(
+                character_id="character_001",
+                canonical_name="甲新名",
+                stable_aliases=["甲", "甲新名"],
+                persona_summary="人类确认",
+                speaking_style=None,
+                age_impression=None,
+                voice_variant_notes=[],
+            )
+        ],
+        removals=["character_002"],
+        merges=[],
+        script_speaker_merges=[],
+        voice_profile_by_character_id={"character_001": "voice_a"},
+        system_voice_assignments={"narrator": "voice_narrator"},
+        workspace_root=workspace.root,
+    )
+
+    registry = CharacterRegistryArtifact.model_validate_json(
+        workspace.character_registry_path.read_text(encoding="utf-8")
+    )
+    assert [character.canonical_name for character in registry.characters] == ["甲新名", "Gamma"]
+    added = next(character for character in registry.characters if character.canonical_name == "Gamma")
+    assert added.stable_aliases == ["Gamma", "G."]
+    assert added.persona_summary == "Human-added supporting character"
+    assert speaker_options("fixture_project", workspace_root=workspace.root) == [
+        "narrator",
+        "unknown_speaker",
+        "甲新名",
+        "Gamma",
+    ]
+    script = ScriptArtifact.model_validate_json(
+        workspace.script_artifact_path("complete").read_text(encoding="utf-8")
+    )
+    assert [segment.speaker for segment in script.segments] == ["甲新名", "unknown_speaker"]
+    context = json.loads(
+        workspace.context_artifact_path("chunk_0001").read_text(encoding="utf-8")
+    )
+    assert context["context"]["active_characters"] == ["甲新名", "unknown_speaker"]
+    assignments = VoiceAssignmentArtifact.model_validate_json(
+        workspace.voice_assignments_path.read_text(encoding="utf-8")
+    )
+    by_speaker = {assignment.speaker: assignment for assignment in assignments.assignments}
+    assert by_speaker["甲新名"].voice_profile_id == "voice_a"
+    assert by_speaker["narrator"].voice_profile_id == "voice_narrator"

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from core.ir.script_revision import script_artifact_revision
 from core.models.character import CharacterRecord, CharacterRegistryArtifact
 from core.models.chunk import ChunksArtifact
 from core.models.ir import ScriptArtifact, ScriptSegment
@@ -10,7 +11,6 @@ from core.pipeline.script_assembly import COMPLETE_SCRIPT_CHUNK_ID
 from core.validation.script_integrity import validate_script_segments
 from storage.json_store import write_json
 from storage.workspace import Workspace
-
 
 RESERVED_SPEAKERS = {"narrator", "unknown_speaker"}
 DEFAULT_ALIAS_CONFIDENCE_THRESHOLD = 0.85
@@ -70,6 +70,7 @@ def run_speaker_key_normalization_workflow(
         llm_provider=script_artifact.llm_provider,
         llm_model=script_artifact.llm_model,
         response_source=script_artifact.response_source,
+        source_script_revision=script_artifact_revision(script_artifact),
         processed_chunk_count=script_artifact.processed_chunk_count,
         segments=normalized_segments,
     )
@@ -84,6 +85,7 @@ def run_speaker_key_normalization_workflow(
         "project_id": project_id,
         "chunk_id": chunk_id,
         "alias_confidence_threshold": alias_confidence_threshold,
+        "source_script_revision": normalized_artifact.source_script_revision,
         "renamed_count": len(renamed),
         "unresolved_count": len(unresolved),
         "renamed": renamed,

@@ -4,7 +4,6 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-
 ReferenceType = Literal[
     "stable_name",
     "honorific",
@@ -61,6 +60,25 @@ class CharacterRecord(BaseModel):
     voice_variant_notes: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)
     review_notes: list[str] = Field(default_factory=list)
+
+
+class CharacterCurationAddition(BaseModel):
+    canonical_name: str
+    stable_aliases: list[str] = Field(default_factory=list)
+    persona_summary: str | None = None
+    speaking_style: str | None = None
+    age_impression: str | None = None
+    voice_variant_notes: list[str] = Field(default_factory=list)
+
+
+class CharacterCurationUpdate(BaseModel):
+    character_id: str
+    canonical_name: str
+    stable_aliases: list[str] = Field(default_factory=list)
+    persona_summary: str | None = None
+    speaking_style: str | None = None
+    age_impression: str | None = None
+    voice_variant_notes: list[str] = Field(default_factory=list)
 
 
 class CharacterRegistryArtifact(BaseModel):

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-
 SYSTEM_PROMPT = """You review audiobook script speaker keys.
 
 Return valid JSON only. Do not wrap JSON in Markdown.
@@ -74,4 +73,50 @@ DECISION RULES:
 - Keep evidence concise and quote only short identifying clues.
 
 Return valid JSON only.
+"""
+
+
+def build_speaker_key_reviewer_batch_user_prompt(
+    *,
+    candidates: list[dict[str, Any]],
+    scene_context: dict[str, Any],
+    relevant_characters: list[dict[str, Any]],
+    allowed_replacement_keys: list[str],
+    confidence_threshold: float,
+) -> str:
+    """Build the compact Stage 3 prompt used for a chunk-local batch."""
+    payload = {
+        "candidates": candidates,
+        "scene_context": scene_context,
+        "characters": relevant_characters,
+        "allowed_replacement_keys": allowed_replacement_keys,
+        "auto_apply_confidence_threshold": confidence_threshold,
+    }
+    schema = {
+        "reviews": [
+            {
+                "segment_id": "seg_000042",
+                "decision": "replace",
+                "replacement_key": "canonical character name",
+                "confidence": 0.91,
+                "reason_code": "local_context_match",
+            }
+        ]
+    }
+    return f"""Review the speaker keys in this one source chunk. Return JSON only.
+
+INPUT:
+{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}
+
+OUTPUT:
+{json.dumps(schema, ensure_ascii=False, separators=(',', ':'))}
+
+Rules:
+- Return exactly one review for every candidate segment_id.
+- Every review object must contain only segment_id, decision, replacement_key, confidence, and reason_code.
+- Do not output current_key, evidence, review_notes, explanations, or any other fields.
+- Review speaker keys only; all script text is immutable.
+- Use replace only with an allowed canonical name, narrator, or unknown_speaker.
+- Use uncertain when local evidence is insufficient or ambiguous; then replacement_key is null.
+- reason_code must be one short identifier: stable_alias, local_context_match, ambiguous, or insufficient_evidence.
 """

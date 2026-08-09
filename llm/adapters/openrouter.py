@@ -13,7 +13,14 @@ class OpenRouterAdapter:
     def __init__(self, config: LlmConfig) -> None:
         self.config = config
 
-    def complete_json(self, system_prompt: str, user_prompt: str) -> LlmCompletion:
+    def complete_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        max_output_tokens: int | None = None,
+        reasoning_effort: str | None = None,
+    ) -> LlmCompletion:
         api_key = _openrouter_api_key()
         if not api_key:
             raise RuntimeError(
@@ -25,22 +32,32 @@ class OpenRouterAdapter:
             api_key=api_key,
             timeout=self.config.timeout_seconds,
         )
-        response = client.chat.completions.create(
-            model=self.config.model,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_output_tokens,
-            response_format={"type": "json_object"},
-            messages=[
+        effective_max_output_tokens = (
+            max_output_tokens
+            if max_output_tokens is not None
+            else self.config.max_output_tokens
+        )
+        request_kwargs: dict[str, object] = {
+            "model": self.config.model,
+            "temperature": self.config.temperature,
+            "max_tokens": effective_max_output_tokens,
+            "response_format": {"type": "json_object"},
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-        )
+        }
+        if reasoning_effort is not None:
+            request_kwargs["extra_body"] = {
+                "reasoning": {"effort": reasoning_effort, "exclude": True}
+            }
+        response = client.chat.completions.create(**request_kwargs)
         choice = response.choices[0]
         usage = response.usage
         if choice.finish_reason == "length":
             raise RuntimeError(
                 "LLM output exceeded max_output_tokens "
-                f"(max_output_tokens={self.config.max_output_tokens}, "
+                f"(max_output_tokens={effective_max_output_tokens}, "
                 f"prompt_tokens={usage.prompt_tokens if usage else None}, "
                 f"completion_tokens={usage.completion_tokens if usage else None})"
             )
