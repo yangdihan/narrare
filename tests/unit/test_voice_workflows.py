@@ -14,9 +14,13 @@ from core.pipeline.qwen_tts import (
 from core.pipeline.voice_assets import import_qwen_voice_assets
 from core.pipeline.voice_assignment import (
     build_voice_assignment_artifact,
+    generate_audio_take,
     generate_voice_sample,
+    list_audio_takes,
     run_audio_generation_workflow,
     save_voice_assignments,
+    select_audio_take,
+    selected_audio_take_numbers,
 )
 from storage.json_store import write_json
 from storage.workspace import Workspace
@@ -196,11 +200,11 @@ def test_qwen_delete_readiness_ignores_source_only_old_paths(
     assert report["safe_to_delete_qwen_folders"] is True
 
 
-def test_qwen_adapter_defaults_to_cpu_instead_of_mps(monkeypatch) -> None:
+def test_qwen_adapter_defaults_to_cuda_while_auto_can_fall_back(monkeypatch) -> None:
     monkeypatch.delenv("NARRARE_QWEN_DEVICE", raising=False)
     monkeypatch.setattr("torch.cuda.is_available", lambda: False)
 
-    assert QwenTTSAdapter().device == "cpu"
+    assert QwenTTSAdapter().device == "cuda"
     assert _resolve_device("auto") == "cpu"
 
 
@@ -272,6 +276,129 @@ def test_voice_assignment_selects_representative_text_and_generates_takes(
     assert result["generated_count"] == 3
     assert workspace.audio_take_path("seg_000001").exists()
     assert workspace.audio_take_manifest_path("seg_000003").exists()
+
+    script = ScriptArtifact.model_validate_json(
+        workspace.script_artifact_path("complete").read_text(encoding="utf-8")
+    )
+    changed_first_segment = script.segments[0].model_copy(
+        update={"script": {"narrator": "修改后的旁白"}}
+    )
+    write_json(
+        workspace.script_artifact_path("complete"),
+        script.model_copy(
+            update={"segments": [changed_first_segment, *script.segments[1:]]}
+        ),
+    )
+    regenerated = run_audio_generation_workflow(
+        "fixture_project",
+        workspace_root=tmp_path / "interim",
+        voice_inventory_path=inventory_path,
+        adapter=DummyTTSAdapter(),
+    )
+    assert regenerated["generated_count"] == 1
+    assert workspace.audio_take_path("seg_000001", 2).exists()
+    assert selected_audio_take_numbers(
+        "fixture_project",
+        workspace_root=tmp_path / "interim",
+    )["seg_000001"] == 2
+
+
+def test_segment_regeneration_preserves_takes_and_persists_selection(
+    tmp_path: Path,
+) -> None:
+    _write_voice_fixture(tmp_path)
+    inventory_path = _write_inventory(tmp_path)
+    build_voice_assignment_artifact(
+        "fixture_project",
+        workspace_root=tmp_path / "interim",
+    )
+    save_voice_assignments(
+        "fixture_project",
+        {"narrator": "voice_a"},
+        workspace_root=tmp_path / "interim",
+    )
+
+    first = generate_audio_take(
+        "fixture_project",
+        "seg_000001",
+        workspace_root=tmp_path / "interim",
+        voice_inventory_path=inventory_path,
+        adapter=DummyTTSAdapter(),
+    )
+    second = generate_audio_take(
+        "fixture_project",
+        "seg_000001",
+        workspace_root=tmp_path / "interim",
+        voice_inventory_path=inventory_path,
+        adapter=DummyTTSAdapter(),
+    )
+
+    assert [first.take_number, second.take_number] == [1, 2]
+    takes = list_audio_takes("fixture_project", workspace_root=tmp_path / "interim")
+    assert [take.take_number for take in takes["seg_000001"]] == [1, 2]
+    assert selected_audio_take_numbers(
+        "fixture_project",
+        workspace_root=tmp_path / "interim",
+    )["seg_000001"] == 2
+
+    select_audio_take(
+        "fixture_project",
+        "seg_000001",
+        1,
+        workspace_root=tmp_path / "interim",
+    )
+    assert selected_audio_take_numbers(
+        "fixture_project",
+        workspace_root=tmp_path / "interim",
+    )["seg_000001"] == 1
+
+
+def test_missing_only_generation_reuses_matching_take_from_prior_script_path(
+    tmp_path: Path,
+) -> None:
+    workspace = _write_voice_fixture(tmp_path)
+    inventory_path = _write_inventory(tmp_path)
+    build_voice_assignment_artifact(
+        "fixture_project",
+        workspace_root=tmp_path / "interim",
+    )
+    source_script = ScriptArtifact.model_validate_json(
+        workspace.script_artifact_path("complete").read_text(encoding="utf-8")
+    )
+    assignments = save_voice_assignments(
+        "fixture_project",
+        {segment.speaker: "voice_a" for segment in source_script.segments},
+        workspace_root=tmp_path / "interim",
+    )
+    generated = run_audio_generation_workflow(
+        "fixture_project",
+        workspace_root=tmp_path / "interim",
+        voice_inventory_path=inventory_path,
+        adapter=DummyTTSAdapter(),
+    )
+    assert generated["generated_count"] == 3
+
+    original_script_path = Path(assignments.script_artifact_path)
+    prior_script = ScriptArtifact.model_validate_json(
+        original_script_path.read_text(encoding="utf-8")
+    )
+    current_script_path = workspace.script_ir_dir / "same_content_new_stage.json"
+    write_json(current_script_path, prior_script)
+    write_json(
+        workspace.voice_assignments_path,
+        assignments.model_copy(
+            update={"script_artifact_path": str(current_script_path)}
+        ),
+    )
+
+    rerun = run_audio_generation_workflow(
+        "fixture_project",
+        workspace_root=tmp_path / "interim",
+        voice_inventory_path=inventory_path,
+        adapter=DummyTTSAdapter(),
+    )
+    assert rerun["generated_count"] == 0
+    assert rerun["skipped_count"] == 3
 
 
 def _write_voice_fixture(tmp_path: Path) -> Workspace:

@@ -29,7 +29,7 @@ class QwenTTSAdapter:
         self.model_path = Path(
             model_path or os.environ.get("NARRARE_QWEN_MODEL", "") or QWEN_DEFAULT_MODEL_PATH
         )
-        self.device = device or os.environ.get("NARRARE_QWEN_DEVICE", "cpu")
+        self.device = device or os.environ.get("NARRARE_QWEN_DEVICE", "cuda")
         self._model: Any | None = None
         self._voice_item_cls: Any | None = None
 

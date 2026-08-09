@@ -11,6 +11,7 @@ class Workspace:
         self.script_ir_dir = self.project_root / "ir" / "script"
         self.audio_dir = self.project_root / "audio"
         self.audio_takes_dir = self.audio_dir / "takes"
+        self.final_audio_dir = self.audio_dir / "final"
         self.voice_samples_dir = self.audio_dir / "voice_samples"
 
     def ensure(self) -> None:
@@ -18,6 +19,7 @@ class Workspace:
         self.context_ir_dir.mkdir(parents=True, exist_ok=True)
         self.script_ir_dir.mkdir(parents=True, exist_ok=True)
         self.audio_takes_dir.mkdir(parents=True, exist_ok=True)
+        self.final_audio_dir.mkdir(parents=True, exist_ok=True)
         self.voice_samples_dir.mkdir(parents=True, exist_ok=True)
 
     @property
@@ -39,6 +41,22 @@ class Workspace:
     @property
     def voice_assignments_path(self) -> Path:
         return self.project_root / "voice_assignments.json"
+
+    @property
+    def audio_take_selections_path(self) -> Path:
+        return self.audio_dir / "selected_takes.json"
+
+    @property
+    def assembly_manifest_path(self) -> Path:
+        return self.project_root / "assembly_manifest.json"
+
+    @property
+    def final_audiobook_path(self) -> Path:
+        return self.final_audio_dir / "audiobook.wav"
+
+    @property
+    def final_audiobook_manifest_path(self) -> Path:
+        return self.final_audio_dir / "audiobook.json"
 
     def voice_sample_path(self, speaker_key: str) -> Path:
         return self.voice_samples_dir / f"{_safe_path_stem(speaker_key)}.wav"

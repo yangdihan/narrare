@@ -63,6 +63,7 @@ class AudioTakeManifest(BaseModel):
     artifact_type: Literal["audio_take"] = "audio_take"
     project_id: str
     segment_id: str
+    take_number: int = Field(default=1, ge=1)
     speaker: str
     text: str
     voice_profile_id: str
@@ -73,3 +74,10 @@ class AudioTakeManifest(BaseModel):
     parameters: dict[str, object] = Field(default_factory=dict)
     output_path: str
     created_at: datetime
+
+
+class AudioTakeSelectionArtifact(BaseModel):
+    artifact_type: Literal["audio_take_selections"] = "audio_take_selections"
+    project_id: str
+    selected_take_by_segment: dict[str, int] = Field(default_factory=dict)
+    updated_at: datetime

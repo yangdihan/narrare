@@ -4,10 +4,20 @@ import argparse
 import sys
 
 from config.loader import load_config
-from core.pipeline.chunking import run_chunking_workflow
+from core.pipeline.audiobook_assembly import (
+    AudiobookAssemblyProgress,
+    run_audiobook_assembly_workflow,
+)
 from core.pipeline.chunk_context_profiler import (
     ContextProfileProgress,
     run_chunk_context_profiler_workflow,
+)
+from core.pipeline.chunking import run_chunking_workflow
+from core.pipeline.qwen_tts import (
+    create_qwen_voice_prompt,
+    generate_qwen_clip,
+    qwen_delete_readiness_report,
+    run_qwen_bootstrap_workflow,
 )
 from core.pipeline.script_assembly import run_script_assembly_workflow
 from core.pipeline.script_conversion import (
@@ -18,14 +28,9 @@ from core.pipeline.speaker_key_normalization import (
     run_speaker_key_normalization_workflow,
 )
 from core.pipeline.speaker_key_review import (
+    DEFAULT_REVIEW_MAX_OUTPUT_TOKENS,
     SpeakerKeyReviewProgress,
     run_speaker_key_review_workflow,
-)
-from core.pipeline.qwen_tts import (
-    create_qwen_voice_prompt,
-    generate_qwen_clip,
-    qwen_delete_readiness_report,
-    run_qwen_bootstrap_workflow,
 )
 from core.pipeline.voice_assets import import_qwen_voice_assets
 from core.pipeline.voice_assignment import (
@@ -121,7 +126,9 @@ def run_script_assemble_command(project_id: str) -> None:
         f"Wrote complete script with {len(result.artifact.segments)} segments "
         f"from {result.artifact.processed_chunk_count} chunks to "
         f"{result.workspace.script_artifact_path('complete')} "
-        f"({result.boundary_merge_count} boundary merges)"
+        f"({result.boundary_merge_count} boundary merges; "
+        f"{result.preserved_segment_id_count} IDs preserved; "
+        f"{result.new_segment_id_count} new IDs)"
     )
 
 
@@ -142,6 +149,8 @@ def run_speaker_key_review_command(
     project_id: str,
     response_dir: str | None = None,
     confidence_threshold: float = 0.85,
+    batch_size: int = 16,
+    max_output_tokens: int = DEFAULT_REVIEW_MAX_OUTPUT_TOKENS,
 ) -> None:
     renderer = SpeakerKeyReviewProgressRenderer(enabled=sys.stderr.isatty())
     try:
@@ -149,6 +158,8 @@ def run_speaker_key_review_command(
             project_id,
             response_dir=response_dir,
             confidence_threshold=confidence_threshold,
+            batch_size=batch_size,
+            max_output_tokens=max_output_tokens,
             progress_callback=renderer.update,
         )
     except RuntimeError as exc:
@@ -227,6 +238,29 @@ def run_audio_generate_command(project_id: str, only_missing: bool) -> None:
     print(
         f"Generated {result['generated_count']} audio takes "
         f"({result['skipped_count']} skipped) under {result['audio_takes_dir']}"
+    )
+
+
+def run_audio_assemble_command(
+    project_id: str,
+    target_active_rms_dbfs: float,
+    peak_ceiling_dbfs: float,
+) -> None:
+    renderer = AudiobookProgressRenderer(enabled=sys.stderr.isatty())
+    try:
+        result = run_audiobook_assembly_workflow(
+            project_id,
+            target_active_rms_dbfs=target_active_rms_dbfs,
+            peak_ceiling_dbfs=peak_ceiling_dbfs,
+            progress_callback=renderer.update,
+        )
+    except RuntimeError as exc:
+        renderer.finish()
+        raise SystemExit(str(exc)) from exc
+    renderer.finish()
+    print(
+        f"Wrote {result.clip_count}-clip audiobook ({result.duration_seconds:.1f}s) "
+        f"to {result.output_path}"
     )
 
 
@@ -504,6 +538,33 @@ class AudioProgressRenderer:
         )
 
 
+class AudiobookProgressRenderer:
+    def __init__(self, *, enabled: bool, width: int = 30) -> None:
+        self.enabled = enabled
+        self.width = width
+        self._last_line_length = 0
+
+    def update(self, progress: AudiobookAssemblyProgress) -> None:
+        total = max(progress.total_clips, 1)
+        processed = min(progress.completed_clips, total)
+        filled = int(self.width * processed / total)
+        bar = "#" * filled + "-" * (self.width - filled)
+        segment = progress.current_segment_id or "all"
+        line = (
+            f"[{bar}] stage=assembly segment={segment} "
+            f"clips={processed}/{progress.total_clips} status={progress.status}"
+        )
+        if self.enabled:
+            padding = max(0, self._last_line_length - len(line))
+            print("\r" + line + (" " * padding), end="", file=sys.stderr, flush=True)
+            self._last_line_length = len(line)
+
+    def finish(self) -> None:
+        if self.enabled and self._last_line_length:
+            print(file=sys.stderr)
+            self._last_line_length = 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="narrare")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -577,6 +638,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.85,
         help="Minimum confidence required to apply a replacement key.",
     )
+    review_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+        help="Maximum unresolved speaker segments per chunk-local LLM request.",
+    )
+    review_parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=DEFAULT_REVIEW_MAX_OUTPUT_TOKENS,
+        help="Per-batch Stage 3 response budget (default: 2400).",
+    )
 
     voice_import_parser = subparsers.add_parser(
         "voice-import",
@@ -609,13 +682,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     audio_parser = subparsers.add_parser(
         "audio-generate",
-        help="Generate one audio take per script segment from confirmed voice assignments.",
+        help="Generate one audio take per script segment from assigned voice profiles.",
     )
     audio_parser.add_argument("--project-id", required=True)
     audio_parser.add_argument(
         "--all",
         action="store_true",
         help="Regenerate all takes instead of only missing take files.",
+    )
+
+    assemble_audio_parser = subparsers.add_parser(
+        "audio-assemble",
+        help="Normalize and concatenate selected current takes into one audiobook WAV.",
+    )
+    assemble_audio_parser.add_argument("--project-id", required=True)
+    assemble_audio_parser.add_argument(
+        "--target-active-rms-dbfs",
+        type=float,
+        default=-20.0,
+    )
+    assemble_audio_parser.add_argument(
+        "--peak-ceiling-dbfs",
+        type=float,
+        default=-1.0,
     )
 
     qwen_bootstrap_parser = subparsers.add_parser(
@@ -644,8 +733,8 @@ def build_parser() -> argparse.ArgumentParser:
     tts_generate_parser.add_argument(
         "--device",
         choices=["auto", "cpu", "mps", "cuda"],
-        default="auto",
-        help="Qwen inference device. Use cpu if Apple MPS crashes.",
+        default="cuda",
+        help="Qwen inference device (defaults to CUDA).",
     )
 
     subparsers.add_parser(
@@ -693,6 +782,8 @@ def main(argv: list[str] | None = None) -> None:
             args.project_id,
             args.response_dir,
             args.confidence_threshold,
+            args.batch_size,
+            args.max_output_tokens,
         )
         return
 
@@ -714,6 +805,14 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "audio-generate":
         run_audio_generate_command(args.project_id, only_missing=not args.all)
+        return
+
+    if args.command == "audio-assemble":
+        run_audio_assemble_command(
+            args.project_id,
+            args.target_active_rms_dbfs,
+            args.peak_ceiling_dbfs,
+        )
         return
 
     if args.command == "qwen-bootstrap":

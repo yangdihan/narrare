@@ -73,7 +73,7 @@ def generate_qwen_clip(
     voice_profile_id: str,
     output_path: str | Path,
     language: str = "Chinese",
-    device: str = "auto",
+    device: str = "cuda",
     voice_inventory_path: str | Path = "data/voices/qwen/voice_profiles.json",
     adapter: QwenTTSAdapter | None = None,
 ) -> dict[str, object]:
