@@ -24,6 +24,20 @@
           Project ID
           <input id="project-id" type="text" autocomplete="off" />
         </label>
+        <div class="global-audio-actions">
+          <button id="generate-all-button" type="button" class="primary">
+            generate all
+          </button>
+          <button id="play-all-button" type="button">play all</button>
+          <audio id="global-audio-player" controls preload="none" hidden></audio>
+        </div>
+        <progress
+          id="global-job-progress"
+          value="0"
+          max="1"
+          aria-label="Active TTS job progress"
+          hidden
+        ></progress>
         <span id="global-status" class="status"></span>
       </section>
 
@@ -52,6 +66,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=staged-edits-1"></script>
+    <script src="/static/app.js?v=global-audio-controls-4"></script>
   </body>
 </html>

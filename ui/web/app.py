@@ -12,22 +12,27 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from core.pipeline.chunk_context_profiler import (
-    ContextProfileProgress,
-    run_chunk_context_profiler_workflow,
-)
-from core.pipeline.chunking import run_chunking_workflow
+from core.models.character import CharacterCurationAddition, CharacterCurationUpdate
 from core.pipeline.character_review import (
     add_character,
+    apply_character_curation,
     apply_character_edits,
+    apply_script_content_edits,
     apply_script_speaker_edits,
     merge_character,
     rename_character,
     speaker_options,
     update_script_segment_speaker,
 )
+from core.pipeline.chunk_context_profiler import (
+    ContextProfileProgress,
+    run_chunk_context_profiler_workflow,
+)
+from core.pipeline.chunking import run_chunking_workflow
+from core.pipeline.qwen_tts import qwen_delete_readiness_report
+from core.pipeline.script_artifact_selection import preferred_script_artifact_paths
 from core.pipeline.script_assembly import (
     COMPLETE_SCRIPT_CHUNK_ID,
     run_script_assembly_workflow,
@@ -37,17 +42,21 @@ from core.pipeline.script_conversion import (
     run_script_conversion_workflow,
 )
 from core.pipeline.speaker_key_review import (
+    DEFAULT_REVIEW_MAX_OUTPUT_TOKENS,
     SpeakerKeyReviewProgress,
     run_speaker_key_review_workflow,
 )
-from core.pipeline.qwen_tts import qwen_delete_readiness_report
 from core.pipeline.voice_assets import load_voice_inventory
 from core.pipeline.voice_assignment import (
     AudioGenerationProgress,
     build_voice_assignment_view,
+    generate_audio_take,
     generate_voice_sample,
+    list_audio_takes,
     run_audio_generation_workflow,
     save_voice_assignments,
+    select_audio_take,
+    selected_audio_take_numbers,
 )
 from core.validation.script_integrity import normalize_content_text
 from storage.workspace import Workspace
@@ -58,17 +67,18 @@ BASE_DIR = Path(__file__).resolve().parent
 
 VIEW_OPTIONS = [
     {"id": "original_text", "label": "Original Text"},
-    {"id": "chunks", "label": "Chunks"},
-    {"id": "scene_summary", "label": "Chunk Scene Summary"},
-    {"id": "character_summary", "label": "Character Summary"},
+    {"id": "characters", "label": "Characters"},
     {"id": "scripts", "label": "Scripts"},
-    {"id": "voice_assignment", "label": "Voice Assignment"},
 ]
 
 VIEW_ALIASES = {
-    "voice-assignment": "voice_assignment",
-    "voice_assignments": "voice_assignment",
-    "voices": "voice_assignment",
+    "character_summary": "characters",
+    "voice_assignment": "characters",
+    "voice-assignment": "characters",
+    "voice_assignments": "characters",
+    "voices": "characters",
+    "chunks": "chunks",
+    "scene_summary": "scene_summary",
 }
 
 
@@ -95,6 +105,11 @@ class Stage2JobRequest(BaseModel):
 class Stage3JobRequest(BaseModel):
     project_id: str
     response_dir: str | None = None
+    confidence_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
+    batch_size: int = Field(default=16, ge=1, le=64)
+    max_output_tokens: int = Field(
+        default=DEFAULT_REVIEW_MAX_OUTPUT_TOKENS, ge=256, le=4_096
+    )
 
 
 class VoiceSampleRequest(BaseModel):
@@ -111,12 +126,25 @@ class AudioGenerationJobRequest(BaseModel):
     only_missing: bool = True
 
 
+class SegmentAudioTakeJobRequest(BaseModel):
+    segment_id: str
+
+
+class AudioTakeSelectionRequest(BaseModel):
+    take_number: int = Field(ge=1)
+
+
 class CharacterAddRequest(BaseModel):
     name: str
 
 
 class CharacterMergeRequest(BaseModel):
     source_character_id: str
+    target_character_id: str
+
+
+class ScriptSpeakerMergeRequest(BaseModel):
+    source_speaker: str
     target_character_id: str
 
 
@@ -131,6 +159,16 @@ class CharacterEditSaveRequest(BaseModel):
     merges: list[CharacterMergeRequest] = []
 
 
+class CharacterCurationSaveRequest(BaseModel):
+    additions: list[CharacterCurationAddition] = []
+    updates: list[CharacterCurationUpdate] = []
+    removals: list[str] = []
+    merges: list[CharacterMergeRequest] = []
+    script_speaker_merges: list[ScriptSpeakerMergeRequest] = []
+    voice_profile_by_character_id: dict[str, str] = {}
+    system_voice_assignments: dict[str, str] = {}
+
+
 class ScriptSpeakerUpdateRequest(BaseModel):
     segment_id: str
     speaker: str
@@ -139,6 +177,25 @@ class ScriptSpeakerUpdateRequest(BaseModel):
 
 class ScriptSpeakerEditSaveRequest(BaseModel):
     edits: list[ScriptSpeakerUpdateRequest] = []
+
+
+class ScriptContentUpdateRequest(BaseModel):
+    segment_id: str
+    speaker: str
+    text: str
+    chunk_id: str | None = None
+
+
+class ScriptInsertRequest(BaseModel):
+    after_segment_id: str | None = None
+    speaker: str
+    text: str
+    chunk_id: str | None = None
+
+
+class ScriptEditSaveRequest(BaseModel):
+    updates: list[ScriptContentUpdateRequest] = []
+    inserts: list[ScriptInsertRequest] = []
 
 
 @dataclass
@@ -199,6 +256,19 @@ class JobRegistry:
     def get(self, job_id: str) -> PipelineJob | None:
         with self._lock:
             return self._jobs.get(job_id)
+
+    def latest_active(self, project_id: str, phase: str) -> PipelineJob | None:
+        with self._lock:
+            return next(
+                (
+                    job
+                    for job in reversed(list(self._jobs.values()))
+                    if job.project_id == project_id
+                    and job.phase == phase
+                    and job.status in {"queued", "running"}
+                ),
+                None,
+            )
 
     def update(self, job_id: str, updater: Callable[[PipelineJob], None]) -> None:
         with self._lock:
@@ -323,13 +393,10 @@ def create_app(
             return _chunks_view(workspace)
         if view_type == "scene_summary":
             return _scene_summary_view(workspace)
-        if view_type == "character_summary":
-            return _character_summary_view(workspace)
+        if view_type == "characters":
+            return _characters_view(request, workspace)
         if view_type == "scripts":
             return _scripts_view(workspace, chunk_id)
-        if view_type == "voice_assignment":
-            return _voice_assignment_view(request, workspace)
-
         raise HTTPException(status_code=404, detail="unknown view type")
 
     @app.post("/api/stage1/jobs")
@@ -429,6 +496,47 @@ def create_app(
             raise HTTPException(status_code=404, detail="job not found")
         return job.to_dict()
 
+    @app.get("/api/projects/{project_id}/audio/jobs/active")
+    def get_active_audio_job(request: Request, project_id: str) -> dict[str, Any]:
+        registry: JobRegistry = request.app.state.jobs
+        job = registry.latest_active(project_id, "tts")
+        return {"job": job.to_dict() if job is not None else None}
+
+    @app.get("/api/projects/{project_id}/audio/playlist")
+    def get_audio_playlist(request: Request, project_id: str) -> dict[str, Any]:
+        payload = _scripts_view(_workspace(request, project_id), None)
+        if not payload.get("available"):
+            raise HTTPException(status_code=404, detail="script artifact not found")
+
+        items = []
+        missing_segment_ids = []
+        for segment in payload.get("segments", []):
+            selected_take = next(
+                (
+                    take
+                    for take in segment.get("audio_takes", [])
+                    if take.get("selected") and take.get("audio_url")
+                ),
+                None,
+            )
+            if selected_take is None:
+                missing_segment_ids.append(str(segment.get("segment_id", "")))
+                continue
+            items.append(
+                {
+                    "segment_id": segment["segment_id"],
+                    "speaker": segment["speaker"],
+                    "take_number": selected_take["take_number"],
+                    "audio_url": selected_take["audio_url"],
+                }
+            )
+        return {
+            "project_id": project_id,
+            "ready": not missing_segment_ids,
+            "items": items,
+            "missing_segment_ids": missing_segment_ids,
+        }
+
     @app.get("/api/stage2/jobs/{job_id}")
     def get_stage2_job(request: Request, job_id: str) -> dict[str, Any]:
         registry: JobRegistry = request.app.state.jobs
@@ -466,7 +574,7 @@ def create_app(
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return _character_summary_view(_workspace(request, project_id))
+        return _characters_view(request, _workspace(request, project_id))
 
     @app.post("/api/projects/{project_id}/characters/merge")
     def merge_character_endpoint(
@@ -483,7 +591,7 @@ def create_app(
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return _character_summary_view(_workspace(request, project_id))
+        return _characters_view(request, _workspace(request, project_id))
 
     @app.patch("/api/projects/{project_id}/characters/rename")
     def rename_character_endpoint(
@@ -500,7 +608,7 @@ def create_app(
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return _character_summary_view(_workspace(request, project_id))
+        return _characters_view(request, _workspace(request, project_id))
 
     @app.post("/api/projects/{project_id}/character-edits")
     def save_character_edits_endpoint(
@@ -521,7 +629,35 @@ def create_app(
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return _character_summary_view(_workspace(request, project_id))
+        return _characters_view(request, _workspace(request, project_id))
+
+    @app.post("/api/projects/{project_id}/characters/curation")
+    def save_character_curation_endpoint(
+        request: Request,
+        project_id: str,
+        payload: CharacterCurationSaveRequest,
+    ) -> dict[str, Any]:
+        try:
+            apply_character_curation(
+                project_id,
+                additions=payload.additions,
+                updates=payload.updates,
+                removals=payload.removals,
+                merges=[
+                    (merge.source_character_id, merge.target_character_id)
+                    for merge in payload.merges
+                ],
+                script_speaker_merges=[
+                    (merge.source_speaker, merge.target_character_id)
+                    for merge in payload.script_speaker_merges
+                ],
+                voice_profile_by_character_id=payload.voice_profile_by_character_id,
+                system_voice_assignments=payload.system_voice_assignments,
+                workspace_root=_state_path(request, "workspace_root"),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _characters_view(request, _workspace(request, project_id))
 
     @app.patch("/api/projects/{project_id}/script-speakers")
     def update_script_speaker_endpoint(
@@ -553,6 +689,29 @@ def create_app(
                 [
                     (edit.segment_id, edit.speaker, edit.chunk_id)
                     for edit in payload.edits
+                ],
+                workspace_root=_state_path(request, "workspace_root"),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _scripts_view(_workspace(request, project_id), None)
+
+    @app.post("/api/projects/{project_id}/script-edits")
+    def save_script_edits_endpoint(
+        request: Request,
+        project_id: str,
+        payload: ScriptEditSaveRequest,
+    ) -> dict[str, Any]:
+        try:
+            apply_script_content_edits(
+                project_id,
+                [
+                    (edit.segment_id, edit.speaker, edit.text, edit.chunk_id)
+                    for edit in payload.updates
+                ],
+                [
+                    (insert.after_segment_id, insert.speaker, insert.text, insert.chunk_id)
+                    for insert in payload.inserts
                 ],
                 workspace_root=_state_path(request, "workspace_root"),
             )
@@ -630,6 +789,45 @@ def create_app(
         )
         thread.start()
         return job.to_dict()
+
+    @app.post("/api/projects/{project_id}/audio/segment-jobs")
+    def start_segment_audio_take_job(
+        request: Request,
+        project_id: str,
+        payload: SegmentAudioTakeJobRequest,
+    ) -> dict[str, Any]:
+        _ensure_tts_generation_enabled(request)
+        registry: JobRegistry = request.app.state.jobs
+        job = registry.create(project_id, "tts", payload.segment_id)
+        thread = threading.Thread(
+            target=_run_segment_audio_take_job,
+            args=(request.app, job.job_id, project_id, payload.segment_id),
+            daemon=True,
+        )
+        thread.start()
+        return job.to_dict()
+
+    @app.post("/api/projects/{project_id}/audio-takes/{segment_id}/select")
+    def select_audio_take_endpoint(
+        request: Request,
+        project_id: str,
+        segment_id: str,
+        payload: AudioTakeSelectionRequest,
+    ) -> dict[str, Any]:
+        try:
+            selections = select_audio_take(
+                project_id,
+                segment_id,
+                payload.take_number,
+                workspace_root=_state_path(request, "workspace_root"),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "project_id": project_id,
+            "segment_id": segment_id,
+            "selected_take_number": selections.selected_take_by_segment[segment_id],
+        }
 
     @app.get("/api/projects/{project_id}/audio-file/{audio_path:path}")
     def get_audio_file(
@@ -879,13 +1077,16 @@ def _run_stage3_job(
             payload.project_id,
             response_dir=response_dir,
             workspace_root=workspace_root,
+            confidence_threshold=payload.confidence_threshold,
+            batch_size=payload.batch_size,
+            max_output_tokens=payload.max_output_tokens,
             progress_callback=on_progress,
         )
 
         def complete(job: PipelineJob) -> None:
             job.status = "complete"
-            job.total_chunks = result.reviewed_count
-            job.completed_chunks = result.reviewed_count
+            job.total_chunks = result.reviewed_count + result.deterministic_renamed_count
+            job.completed_chunks = result.reviewed_count + result.deterministic_renamed_count
             job.current_chunk_id = None
             job.current_speaker = None
             job.errors = result.errors
@@ -896,6 +1097,11 @@ def _run_stage3_job(
                     )
                 ),
                 "review_report": str(result.report_path),
+                "stage3_metrics": (
+                    f"deterministic={result.deterministic_renamed_count}; "
+                    f"unresolved={result.unresolved_count}; batches={result.llm_batch_count}; "
+                    f"prompt_tokens={result.prompt_tokens}; output_tokens={result.output_tokens}"
+                ),
             }
 
         registry.update(job_id, complete)
@@ -959,6 +1165,54 @@ def _run_audio_generation_job(
                 job.errors = [error_message]
             job.current_chunk_id = None
             job.current_speaker = None
+
+        registry.update(job_id, fail)
+
+
+def _run_segment_audio_take_job(
+    app: FastAPI,
+    job_id: str,
+    project_id: str,
+    segment_id: str,
+) -> None:
+    registry: JobRegistry = app.state.jobs
+    workspace_root: Path = app.state.workspace_root
+
+    def running(job: PipelineJob) -> None:
+        job.status = "running"
+        job.total_chunks = 1
+        job.completed_chunks = 0
+        job.current_chunk_id = segment_id
+
+    registry.update(job_id, running)
+    try:
+        manifest = generate_audio_take(
+            project_id,
+            segment_id,
+            workspace_root=workspace_root,
+            voice_inventory_path=app.state.voice_inventory_path,
+            adapter=_app_tts_adapter(app),
+        )
+
+        def complete(job: PipelineJob) -> None:
+            job.status = "complete"
+            job.total_chunks = 1
+            job.completed_chunks = 1
+            job.current_chunk_id = None
+            job.artifact_paths = {
+                "audio_take": manifest.output_path,
+                "take_number": str(manifest.take_number),
+            }
+
+        registry.update(job_id, complete)
+    except Exception as exc:
+        error_message = str(exc)
+
+        def fail(job: PipelineJob) -> None:
+            job.status = "failed"
+            if not job.errors:
+                job.errors = [error_message]
+            job.current_chunk_id = None
 
         registry.update(job_id, fail)
 
@@ -1068,20 +1322,60 @@ def _scene_summary_view(workspace: Workspace) -> dict[str, Any]:
     }
 
 
-def _character_summary_view(workspace: Workspace) -> dict[str, Any]:
+def _characters_view(request: Request, workspace: Workspace) -> dict[str, Any]:
     if not workspace.character_registry_path.exists():
-        return _empty_view(
+        registry = {"project_id": workspace.project_id, "characters": []}
+    else:
+        registry = _read_json(workspace.character_registry_path)
+    characters = [
+        {key: value for key, value in character.items() if key != "confirmed"}
+        for character in registry.get("characters", [])
+    ]
+    registry = {**registry, "characters": characters}
+    assignments = []
+    missing_voice_profile_ids: list[str] = []
+    script_artifact_path: str | None = None
+    try:
+        voice_view = build_voice_assignment_view(
             workspace.project_id,
-            "character_summary",
-            "No character registry exists for this project.",
+            workspace_root=_state_path(request, "workspace_root"),
+            voice_inventory_path=_state_path(request, "voice_inventory_path"),
         )
-    registry = _read_json(workspace.character_registry_path)
+        assignments = _assignment_payloads(voice_view.assignments, workspace=workspace)
+        missing_voice_profile_ids = voice_view.missing_voice_profile_ids
+        script_artifact_path = str(voice_view.script_artifact_path)
+    except RuntimeError:
+        voice_view = None
+
+    voice_profiles = []
+    try:
+        inventory = load_voice_inventory(_state_path(request, "voice_inventory_path"))
+        voice_profiles = _voice_profile_payloads(
+            request,
+            [
+                {
+                    **profile.model_dump(),
+                    "available": Path(profile.prompt_path).exists(),
+                }
+                for profile in inventory.profiles
+            ],
+        )
+    except RuntimeError:
+        pass
     return {
         "project_id": workspace.project_id,
-        "view_type": "character_summary",
+        "view_type": "characters",
         "available": True,
         "registry": registry,
-        "characters": registry.get("characters", []),
+        "characters": characters,
+        "script_speaker_keys": _script_speaker_keys(workspace),
+        "assignments": assignments,
+        "voice_profiles": voice_profiles,
+        "missing_voice_profile_ids": missing_voice_profile_ids,
+        "script_artifact_path": script_artifact_path,
+        "tts_generation_enabled": _tts_generation_enabled(request),
+        "tts_generation_status": _tts_generation_status(request),
+        "review": _character_review_payload(workspace, registry),
     }
 
 
@@ -1097,6 +1391,13 @@ def _scripts_view(
             "No script artifacts exist for this project.",
         )
     stage3_missing_inputs = _stage3_missing_inputs(workspace)
+    continuous_payload = {
+        **continuous_payload,
+        "segments": _segments_with_audio_takes(
+            workspace,
+            continuous_payload.get("segments", []),
+        ),
+    }
 
     return {
         "project_id": workspace.project_id,
@@ -1105,6 +1406,7 @@ def _scripts_view(
         "requested_chunk_id": chunk_id,
         "script_options": _script_options(workspace),
         "speaker_options": _speaker_options_payload(workspace),
+        "speaker_filter_options": _script_speaker_keys(workspace),
         "stage3_enabled": not stage3_missing_inputs,
         "stage3_missing_inputs": stage3_missing_inputs,
         **continuous_payload,
@@ -1127,27 +1429,56 @@ def _stage3_missing_inputs(workspace: Workspace) -> list[str]:
     return missing
 
 
-def _voice_assignment_view(request: Request, workspace: Workspace) -> dict[str, Any]:
-    try:
-        view = build_voice_assignment_view(
-            workspace.project_id,
-            workspace_root=_state_path(request, "workspace_root"),
-            voice_inventory_path=_state_path(request, "voice_inventory_path"),
-        )
-    except RuntimeError as exc:
-        return _empty_view(workspace.project_id, "voice_assignment", str(exc))
+def _script_speaker_keys(workspace: Workspace) -> list[str]:
+    continuous = _continuous_script_payload(workspace)
+    if continuous is None:
+        return []
+    seen: set[str] = set()
+    keys = []
+    for segment in continuous.get("segments", []):
+        speaker = segment.get("speaker")
+        if isinstance(speaker, str) and speaker and speaker not in seen:
+            seen.add(speaker)
+            keys.append(speaker)
+    return keys
 
+
+def _character_review_payload(
+    workspace: Workspace,
+    registry: dict[str, Any],
+) -> dict[str, Any]:
+    characters = registry.get("characters", [])
+    alias_owners: dict[str, list[str]] = {}
+    for character in characters:
+        character_id = str(character.get("character_id", ""))
+        references = [
+            *character.get("stable_aliases", []),
+            *character.get("aliases", []),
+        ]
+        for alias in [character.get("canonical_name"), *references]:
+            if isinstance(alias, str) and alias.strip():
+                alias_owners.setdefault(alias.strip(), []).append(character_id)
+
+    conflicts = [
+        {
+            "type": "shared_alias",
+            "alias": alias,
+            "character_ids": character_ids,
+        }
+        for alias, character_ids in alias_owners.items()
+        if len(set(character_ids)) > 1
+    ]
+    continuous = _continuous_script_payload(workspace)
+    unknown_segment_ids = []
+    if continuous is not None:
+        unknown_segment_ids = [
+            segment["segment_id"]
+            for segment in continuous.get("segments", [])
+            if segment.get("speaker") == "unknown_speaker"
+        ]
     return {
-        "project_id": workspace.project_id,
-        "view_type": "voice_assignment",
-        "available": True,
-        "tts_generation_enabled": _tts_generation_enabled(request),
-        "tts_generation_status": _tts_generation_status(request),
-        "script_artifact_path": str(view.script_artifact_path),
-        "voice_inventory_path": str(view.inventory_path),
-        "voice_profiles": _voice_profile_payloads(request, view.voice_profiles),
-        "missing_voice_profile_ids": view.missing_voice_profile_ids,
-        "assignments": _assignment_payloads(view.assignments, workspace=workspace),
+        "conflicts": conflicts,
+        "unknown_script_segment_ids": unknown_segment_ids,
     }
 
 
@@ -1210,11 +1541,7 @@ def _continuous_script_payload(workspace: Workspace) -> dict[str, Any] | None:
 
 
 def _preferred_complete_script_paths(workspace: Workspace) -> list[Path]:
-    return [
-        workspace.key_reviewed_script_artifact_path(COMPLETE_SCRIPT_CHUNK_ID),
-        workspace.normalized_script_artifact_path(COMPLETE_SCRIPT_CHUNK_ID),
-        workspace.script_artifact_path(COMPLETE_SCRIPT_CHUNK_ID),
-    ]
+    return preferred_script_artifact_paths(workspace, COMPLETE_SCRIPT_CHUNK_ID)
 
 
 def _stitched_chunk_script_payload(workspace: Workspace) -> dict[str, Any] | None:
@@ -1396,13 +1723,87 @@ def _script_segments_with_validation(
     return output
 
 
+def _segments_with_audio_takes(
+    workspace: Workspace,
+    segments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    takes_by_segment = list_audio_takes(
+        workspace.project_id,
+        workspace_root=workspace.root,
+    )
+    selected_take_numbers = selected_audio_take_numbers(
+        workspace.project_id,
+        workspace_root=workspace.root,
+    )
+    assigned_profiles: dict[str, str | None] | None = None
+    if workspace.voice_assignments_path.exists():
+        try:
+            assignment_payload = _read_json(workspace.voice_assignments_path)
+            assigned_profiles = {
+                str(assignment.get("speaker", "")): assignment.get("voice_profile_id")
+                for assignment in assignment_payload.get("assignments", [])
+            }
+        except (OSError, ValueError):
+            assigned_profiles = None
+    output = []
+    for segment in segments:
+        segment_id = str(segment.get("segment_id", ""))
+        speaker = str(segment.get("speaker", ""))
+        text = str(segment.get("text", ""))
+        historical_takes = takes_by_segment.get(segment_id, [])
+        assigned_profile = (
+            assigned_profiles.get(speaker) if assigned_profiles is not None else None
+        )
+        takes = [
+            take
+            for take in historical_takes
+            if take.speaker == speaker
+            and take.text == text
+            and (
+                assigned_profiles is None
+                or (
+                    bool(assigned_profile)
+                    and take.voice_profile_id == assigned_profile
+                )
+            )
+        ]
+        selected_take_number = selected_take_numbers.get(segment_id)
+        if selected_take_number is not None and not any(
+            take.take_number == selected_take_number for take in takes
+        ):
+            selected_take_number = None
+        if selected_take_number is None and any(
+            take.take_number == 1 for take in takes
+        ):
+            selected_take_number = 1
+        output.append(
+            {
+                **segment,
+                "audio_takes": [
+                    {
+                        "take_number": take.take_number,
+                        "audio_url": _audio_url(workspace, take.output_path),
+                        "selected": take.take_number == selected_take_number,
+                        "voice_profile_id": take.voice_profile_id,
+                    }
+                    for take in takes
+                ],
+                "stale_audio_take_count": len(historical_takes) - len(takes),
+            }
+        )
+    return output
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _canonical_view_type(view_type: str) -> str:
     normalized = VIEW_ALIASES.get(view_type, view_type)
-    if normalized not in {option["id"] for option in VIEW_OPTIONS}:
+    if normalized not in {option["id"] for option in VIEW_OPTIONS} | {
+        "chunks",
+        "scene_summary",
+    }:
         raise HTTPException(status_code=404, detail="unknown view type")
     return normalized
 
@@ -1526,11 +1927,12 @@ def _view_available(
         return workspace.chunks_path.exists()
     if view_type == "scene_summary":
         return any(workspace.context_ir_dir.glob("*_context.json"))
-    if view_type == "character_summary":
-        return workspace.character_registry_path.exists()
+    if view_type == "characters":
+        return (
+            workspace.character_registry_path.exists()
+            or _continuous_script_payload(workspace) is not None
+        )
     if view_type == "scripts":
-        return _continuous_script_payload(workspace) is not None
-    if view_type == "voice_assignment":
         return _continuous_script_payload(workspace) is not None
     return False
 
